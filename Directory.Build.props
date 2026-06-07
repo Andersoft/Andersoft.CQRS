@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <Authors>Andersoft</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Andersoft/Analyers</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+</Project>

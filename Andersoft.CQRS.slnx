@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Andersoft.CQRS/Andersoft.CQRS.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Andersoft.CQRS.Tests/Andersoft.CQRS.Tests.csproj" />
+  </Folder>
+</Solution>
