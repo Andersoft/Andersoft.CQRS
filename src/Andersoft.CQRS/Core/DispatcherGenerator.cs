@@ -252,7 +252,7 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             if (hasInterceptors)
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, query, () => new System.Threading.Tasks.ValueTask<{query.ResultType}>(_{camel}Handler.HandleAsync(query, ct)), ct);");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, query, () => _{camel}Handler.HandleAsync(query, ct), ct);");
                 sb.AppendLine("    }");
             }
             else
@@ -274,7 +274,7 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             if (hasInterceptors)
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, command, () => new System.Threading.Tasks.ValueTask<{command.ResultType}>(_{camel}Handler.HandleAsync(command, ct)), ct);");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, command, () => _{camel}Handler.HandleAsync(command, ct), ct);");
                 sb.AppendLine("    }");
             }
             else
