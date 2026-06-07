@@ -26,7 +26,6 @@ namespace Andersoft.CQRS.Abstractions
     public interface ICommandHandler<in TCommand, TResult> where TCommand : ICommand<TResult> { Task<TResult> HandleAsync(TCommand command, CancellationToken ct = default); }
     public interface IInterceptHandler<in TMessage, TResult> { ValueTask<TResult> HandleAsync(TMessage message, RequestHandlerDelegate<TResult> next, CancellationToken ct); }
     public delegate ValueTask<TResult> RequestHandlerDelegate<TResult>();
-    public interface IApplicationChannelDispatcher { ValueTask<TResult> DispatchAsync<TResult>(Func<CancellationToken, ValueTask<TResult>> operation, CancellationToken ct, string operationName); }
     public interface IDomainEventHandler<in TEvent> { Task HandleAsync(TEvent domainEvent, CancellationToken ct = default); }
 }";
 

@@ -172,7 +172,6 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine("");
         sb.AppendLine("public sealed class TypedDispatcher");
         sb.AppendLine("{");
-        sb.AppendLine("    private readonly IApplicationChannelDispatcher _channel;");
 
         // Handler fields
         foreach (var query in queries)
@@ -197,7 +196,6 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         // Constructor
         sb.AppendLine();
         sb.AppendLine("    public TypedDispatcher(");
-        sb.AppendLine("        IApplicationChannelDispatcher channel,");
 
         var paramList = new List<string>();
         foreach (var query in queries)
@@ -218,7 +216,6 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
 
         sb.AppendLine(string.Join(",\n", paramList) + ")");
         sb.AppendLine("    {");
-        sb.AppendLine("        _channel = channel;");
 
         foreach (var query in queries)
         {
@@ -255,18 +252,12 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             if (hasInterceptors)
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return _channel.DispatchAsync(");
-                sb.AppendLine($"            token => ChainInterceptors(_{camel}Interceptors, query, () => new System.Threading.Tasks.ValueTask<{query.ResultType}>(_{camel}Handler.HandleAsync(query, token)), token),");
-                sb.AppendLine($"            ct,");
-                sb.AppendLine($"            \"{query.ShortName}\");");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, query, () => new System.Threading.Tasks.ValueTask<{query.ResultType}>(_{camel}Handler.HandleAsync(query, ct)), ct);");
                 sb.AppendLine("    }");
             }
             else
             {
-                sb.AppendLine("        => _channel.DispatchAsync(");
-                sb.AppendLine($"            token => new System.Threading.Tasks.ValueTask<{query.ResultType}>(_{camel}Handler.HandleAsync(query, token)),");
-                sb.AppendLine($"            ct,");
-                sb.AppendLine($"            \"{query.ShortName}\");");
+                sb.AppendLine($"        => _{camel}Handler.HandleAsync(query, ct);");
             }
         }
 
@@ -283,18 +274,12 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             if (hasInterceptors)
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return _channel.DispatchAsync(");
-                sb.AppendLine($"            token => ChainInterceptors(_{camel}Interceptors, command, () => new System.Threading.Tasks.ValueTask<{command.ResultType}>(_{camel}Handler.HandleAsync(command, token)), token),");
-                sb.AppendLine($"            ct,");
-                sb.AppendLine($"            \"{command.ShortName}\");");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, command, () => new System.Threading.Tasks.ValueTask<{command.ResultType}>(_{camel}Handler.HandleAsync(command, ct)), ct);");
                 sb.AppendLine("    }");
             }
             else
             {
-                sb.AppendLine("        => _channel.DispatchAsync(");
-                sb.AppendLine($"            token => new System.Threading.Tasks.ValueTask<{command.ResultType}>(_{camel}Handler.HandleAsync(command, token)),");
-                sb.AppendLine($"            ct,");
-                sb.AppendLine($"            \"{command.ShortName}\");");
+                sb.AppendLine($"        => _{camel}Handler.HandleAsync(command, ct);");
             }
         }
 
