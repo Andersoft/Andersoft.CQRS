@@ -2,7 +2,7 @@
   <PropertyGroup>
     <Authors>Andersoft</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/Andersoft/Analyers</RepositoryUrl>
+    <RepositoryUrl>https://github.com/Andersoft/Andersoft.CQRS</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 </Project>
