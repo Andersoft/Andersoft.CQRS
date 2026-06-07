@@ -42,3 +42,10 @@ jobs:
           --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
           --api-key ${{ secrets.GITHUB_TOKEN }}
           --skip-duplicate
+
+      - name: Publish to NuGet.org
+        run: >
+          dotnet nuget push ./nupkgs/Andersoft.CQRS.*.nupkg
+          --source https://api.nuget.org/v3/index.json
+          --api-key ${{ secrets.NUGET_API_KEY }}
+          --skip-duplicate
