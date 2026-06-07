@@ -165,8 +165,9 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine("#nullable enable");
         sb.AppendLine();
         sb.AppendLine("using Andersoft.CQRS;");
+        sb.AppendLine("using Andersoft.CQRS.Abstractions;");
         sb.AppendLine();
-        sb.AppendLine("namespace Andersoft.CQRS.Generated;");
+        sb.AppendLine("namespace Andersoft.CQRS;");
         sb.AppendLine();
         sb.AppendLine("");
         sb.AppendLine("public sealed class TypedDispatcher");
@@ -328,8 +329,9 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine();
         sb.AppendLine("using Microsoft.Extensions.DependencyInjection;");
         sb.AppendLine("using Andersoft.CQRS;");
+        sb.AppendLine("using Andersoft.CQRS.Abstractions;");
         sb.AppendLine();
-        sb.AppendLine("namespace Andersoft.CQRS.Generated;");
+        sb.AppendLine("namespace Andersoft.CQRS;");
         sb.AppendLine();
         sb.AppendLine("public static class HandlerRegistration");
         sb.AppendLine("{");
