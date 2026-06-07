@@ -1,0 +1,5 @@
+<Project>
+    <ItemGroup Condition="'$(DesignTimeBuild)' != 'true' Or '$(BuildingProject)' == 'true'">
+        <Analyzer Include="$(MSBuildThisFileDirectory)..\analyzers\dotnet\cs\Andersoft.CQRS.dll" />
+    </ItemGroup>
+</Project>
