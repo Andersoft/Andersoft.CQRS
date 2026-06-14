@@ -35,12 +35,13 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             var messages = pair.Left;
             var handlers = pair.Right;
 
-            if (!messages.IsEmpty)
+            if (!messages.IsEmpty || handlers.Any(h => h.Kind == HandlerKind.DomainEvent))
             {
                 var queries = messages.Where(m => m!.Kind == MessageKind.Query).ToList();
                 var commands = messages.Where(m => m!.Kind == MessageKind.Command).ToList();
                 var interceptors = handlers.Where(h => h.Kind == HandlerKind.Interceptor).ToList();
-                var source = GenerateTypedDispatcher(queries!, commands!, interceptors);
+                var domainEvents = handlers.Where(h => h.Kind == HandlerKind.DomainEvent).ToList();
+                var source = GenerateTypedDispatcher(queries!, commands!, interceptors, domainEvents);
                 spc.AddSource("TypedDispatcher.g.cs", SourceText.From(source, Encoding.UTF8));
             }
 
@@ -151,7 +152,8 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
     private static string GenerateTypedDispatcher(
         List<MessageTypeInfo> queries,
         List<MessageTypeInfo> commands,
-        List<HandlerTypeInfo> interceptors)
+        List<HandlerTypeInfo> interceptors,
+        List<HandlerTypeInfo> domainEvents)
     {
         // Build a lookup: messageType -> resultType for interceptors
         var interceptorsByMessage = new Dictionary<string, string>();
@@ -193,6 +195,14 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             }
         }
 
+        // Domain event handler fields
+        var domainEventGroups = domainEvents.GroupBy(d => d.MessageType).ToList();
+        foreach (var group in domainEventGroups)
+        {
+            var shortName = ExtractShortName(group.Key);
+            sb.AppendLine($"    private readonly System.Collections.Generic.List<IDomainEventHandler<{group.Key}>> _{ToCamelCase(shortName)}Handlers;");
+        }
+
         // Constructor
         sb.AppendLine();
         sb.AppendLine("    public TypedDispatcher(");
@@ -212,6 +222,12 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             {
                 paramList.Add($"        System.Collections.Generic.IEnumerable<IInterceptHandler<{msg.FullTypeName}, {msg.ResultType}>> {ToCamelCase(msg.ShortName)}Interceptors");
             }
+        }
+
+        foreach (var group in domainEventGroups)
+        {
+            var shortName = ExtractShortName(group.Key);
+            paramList.Add($"        System.Collections.Generic.IEnumerable<IDomainEventHandler<{group.Key}>> {ToCamelCase(shortName)}Handlers");
         }
 
         sb.AppendLine(string.Join(",\n", paramList) + ")");
@@ -234,6 +250,13 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
                 var camel = ToCamelCase(msg.ShortName);
                 sb.AppendLine($"        _{camel}Interceptors = System.Linq.Enumerable.ToList({camel}Interceptors ?? System.Array.Empty<IInterceptHandler<{msg.FullTypeName}, {msg.ResultType}>>());");
             }
+        }
+
+        foreach (var group in domainEventGroups)
+        {
+            var shortName = ExtractShortName(group.Key);
+            var camel = ToCamelCase(shortName);
+            sb.AppendLine($"        _{camel}Handlers = System.Linq.Enumerable.ToList({camel}Handlers ?? System.Array.Empty<IDomainEventHandler<{group.Key}>>());");
         }
 
         sb.AppendLine("    }");
@@ -283,6 +306,21 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             }
         }
 
+        // PublishAsync methods
+        foreach (var group in domainEventGroups)
+        {
+            var shortName = ExtractShortName(group.Key);
+            var camel = ToCamelCase(shortName);
+
+            sb.AppendLine();
+            sb.AppendLine("    public System.Threading.Tasks.ValueTask PublishAsync(");
+            sb.AppendLine($"        {group.Key} domainEvent,");
+            sb.AppendLine("        System.Threading.CancellationToken ct = default)");
+            sb.AppendLine("    {");
+            sb.AppendLine($"        return PublishToHandlers(_{camel}Handlers, domainEvent, ct);");
+            sb.AppendLine("    }");
+        }
+
         // ChainInterceptors helper method
         sb.AppendLine();
         sb.AppendLine("    private static System.Threading.Tasks.ValueTask<TResult> ChainInterceptors<TMessage, TResult>(");
@@ -299,6 +337,19 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine("            next = () => interceptor.HandleAsync(message, current, ct);");
         sb.AppendLine("        }");
         sb.AppendLine("        return next();");
+        sb.AppendLine("    }");
+
+        // PublishToHandlers helper
+        sb.AppendLine();
+        sb.AppendLine("    private static async System.Threading.Tasks.ValueTask PublishToHandlers<TEvent>(");
+        sb.AppendLine("        System.Collections.Generic.List<IDomainEventHandler<TEvent>> handlers,");
+        sb.AppendLine("        TEvent domainEvent,");
+        sb.AppendLine("        System.Threading.CancellationToken ct)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        foreach (var handler in handlers)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            await handler.HandleAsync(domainEvent, ct);");
+        sb.AppendLine("        }");
         sb.AppendLine("    }");
 
         sb.AppendLine("}");
@@ -336,6 +387,7 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             sb.AppendLine($"        services.AddScoped<{interfaceType}, {handler.HandlerType}>();");
         }
 
+        sb.AppendLine("        services.AddScoped<TypedDispatcher>();");
         sb.AppendLine("        return services;");
         sb.AppendLine("    }");
         sb.AppendLine("}");
@@ -348,6 +400,12 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         if (string.IsNullOrEmpty(s) || char.IsLower(s[0]))
             return s;
         return char.ToLowerInvariant(s[0]) + s.Substring(1);
+    }
+
+    private static string ExtractShortName(string fullTypeName)
+    {
+        var lastDot = fullTypeName.LastIndexOf('.');
+        return lastDot >= 0 ? fullTypeName.Substring(lastDot + 1) : fullTypeName;
     }
 
     private sealed class MessageTypeInfo

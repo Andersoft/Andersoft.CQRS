@@ -5,5 +5,5 @@ namespace Andersoft.CQRS.Abstractions;
 
 public interface IDomainEventHandler<in TEvent>
 {
-    Task HandleAsync(TEvent domainEvent, CancellationToken ct = default);
+    ValueTask HandleAsync(TEvent domainEvent, CancellationToken ct = default);
 }
