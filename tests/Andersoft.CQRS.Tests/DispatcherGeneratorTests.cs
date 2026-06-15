@@ -155,6 +155,73 @@ namespace TestApp
     }
 
     [Fact]
+    public void DomainEvents_GenerateCatchAllPublish_TypedToCommonMarkerInterface()
+    {
+        var source = ContractsSource + @"
+
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public interface IDomainEvent { }
+    public record UserCreatedEvent : IDomainEvent { }
+    public record UserDeletedEvent : IDomainEvent { }
+    public class UserCreatedHandler : IDomainEventHandler<UserCreatedEvent>
+    {
+        public Task HandleAsync(UserCreatedEvent e, CancellationToken ct = default) => Task.CompletedTask;
+    }
+    public class UserDeletedHandler : IDomainEventHandler<UserDeletedEvent>
+    {
+        public Task HandleAsync(UserDeletedEvent e, CancellationToken ct = default) => Task.CompletedTask;
+    }
+}";
+
+        var (genResult, _) = Run(source);
+        var generated = genResult.Results[0].GeneratedSources;
+
+        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
+
+        // Per-type overloads still present
+        Assert.Contains("PublishAsync(\n        TestApp.UserCreatedEvent domainEvent", dispatcherSrc);
+
+        // Catch-all typed to the shared marker interface, switching on the concrete type
+        Assert.Contains("PublishAsync(\n        TestApp.IDomainEvent domainEvent", dispatcherSrc);
+        Assert.Contains("=> domainEvent switch", dispatcherSrc);
+        Assert.Contains("TestApp.UserCreatedEvent e => PublishAsync(e, ct),", dispatcherSrc);
+        Assert.Contains("TestApp.UserDeletedEvent e => PublishAsync(e, ct),", dispatcherSrc);
+        Assert.Contains("_ => default,", dispatcherSrc);
+    }
+
+    [Fact]
+    public void DomainEvents_WithNoCommonInterface_CatchAllFallsBackToObject()
+    {
+        var source = ContractsSource + @"
+
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public record UserCreatedEvent { }
+    public class UserCreatedHandler : IDomainEventHandler<UserCreatedEvent>
+    {
+        public Task HandleAsync(UserCreatedEvent e, CancellationToken ct = default) => Task.CompletedTask;
+    }
+}";
+
+        var (genResult, _) = Run(source);
+        var generated = genResult.Results[0].GeneratedSources;
+
+        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
+
+        Assert.Contains("PublishAsync(\n        object domainEvent", dispatcherSrc);
+        Assert.Contains("TestApp.UserCreatedEvent e => PublishAsync(e, ct),", dispatcherSrc);
+    }
+
+    [Fact]
     public void MultipleQueries_GeneratesAllDispatchMethods()
     {
         var source = ContractsSource + @"

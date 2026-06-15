@@ -137,11 +137,17 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             {
                 if (ifaceName == "Andersoft.CQRS.Abstractions.IDomainEventHandler<TEvent>")
                 {
+                    // Exclude framework interfaces (e.g. the IEquatable<TSelf> records synthesize)
+                    // so only user-defined domain markers remain to derive the catch-all type from.
+                    var eventInterfaces = string.Join("|", typeArgs[0].AllInterfaces
+                        .Select(i => i.ToDisplayString())
+                        .Where(name => !name.StartsWith("System.")));
                     results.Add(new HandlerTypeInfo(
                         classSymbol.ToDisplayString(),
                         typeArgs[0].ToDisplayString(),
                         "System.Threading.Tasks.Task",
-                        HandlerKind.DomainEvent));
+                        HandlerKind.DomainEvent,
+                        eventInterfaces));
                 }
             }
         }
@@ -321,6 +327,41 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             sb.AppendLine("    }");
         }
 
+        // Catch-all PublishAsync: dispatches to the matching concrete overload at runtime.
+        // Needed because callers (e.g. the SaveChanges interceptor) only know events as the
+        // base IDomainEvent interface, while the per-type overloads above are concrete.
+        if (domainEventGroups.Count > 0)
+        {
+            // The catch-all parameter is the single interface common to every event type
+            // (typically the IDomainEvent marker). Falls back to object if there isn't one.
+            var interfaceSets = domainEventGroups
+                .Select(g => g.First().EventInterfaces
+                    .Split(new[] { '|' }, System.StringSplitOptions.RemoveEmptyEntries)
+                    .ToList())
+                .ToList();
+
+            var common = interfaceSets[0];
+            for (var i = 1; i < interfaceSets.Count; i++)
+            {
+                common = common.Where(x => interfaceSets[i].Contains(x)).ToList();
+            }
+
+            var catchAllType = common.Count == 1 ? common[0] : "object";
+
+            sb.AppendLine();
+            sb.AppendLine("    public System.Threading.Tasks.ValueTask PublishAsync(");
+            sb.AppendLine($"        {catchAllType} domainEvent,");
+            sb.AppendLine("        System.Threading.CancellationToken ct = default)");
+            sb.AppendLine("        => domainEvent switch");
+            sb.AppendLine("        {");
+            foreach (var group in domainEventGroups)
+            {
+                sb.AppendLine($"            {group.Key} e => PublishAsync(e, ct),");
+            }
+            sb.AppendLine("            _ => default,");
+            sb.AppendLine("        };");
+        }
+
         // ChainInterceptors helper method
         sb.AppendLine();
         sb.AppendLine("    private static System.Threading.Tasks.ValueTask<TResult> ChainInterceptors<TMessage, TResult>(");
@@ -431,12 +472,19 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         public string ResultType { get; }
         public HandlerKind Kind { get; }
 
-        public HandlerTypeInfo(string handlerType, string messageType, string resultType, HandlerKind kind)
+        /// <summary>
+        /// For domain-event handlers, the pipe-delimited list of interfaces implemented by the
+        /// event type. Used to derive the common marker interface for the catch-all dispatch.
+        /// </summary>
+        public string EventInterfaces { get; }
+
+        public HandlerTypeInfo(string handlerType, string messageType, string resultType, HandlerKind kind, string eventInterfaces = "")
         {
             HandlerType = handlerType;
             MessageType = messageType;
             ResultType = resultType;
             Kind = kind;
+            EventInterfaces = eventInterfaces;
         }
     }
 
