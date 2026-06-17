@@ -130,6 +130,90 @@ namespace TestApp
     }
 
     [Fact]
+    public void OpenGenericInterceptor_AppliesToEveryMessage()
+    {
+        var source = ContractsSource + @"
+
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public record GetUserQuery : IQuery<string> { }
+    public record CreateOrderCommand : ICommand<int> { }
+    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    {
+        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
+    }
+    public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, int>
+    {
+        public Task<int> HandleAsync(CreateOrderCommand command, CancellationToken ct = default) => Task.FromResult(1);
+    }
+    public class LoggingInterceptor<TMessage, TResult> : IInterceptHandler<TMessage, TResult>
+    {
+        public ValueTask<TResult> HandleAsync(TMessage msg, RequestHandlerDelegate<TResult> next, CancellationToken ct) => next();
+    }
+}";
+
+        var (genResult, _) = Run(source);
+        var generated = genResult.Results[0].GeneratedSources;
+
+        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
+
+        // Both the query and the command get an interceptor pipeline even though no closed
+        // interceptor targets either of them.
+        Assert.Contains("_getUserQueryInterceptors", dispatcherSrc);
+        Assert.Contains("_createOrderCommandInterceptors", dispatcherSrc);
+        Assert.Contains("ChainInterceptors(_getUserQueryInterceptors", dispatcherSrc);
+        Assert.Contains("ChainInterceptors(_createOrderCommandInterceptors", dispatcherSrc);
+
+        // Open generic interceptor is registered against the unbound interface.
+        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
+        Assert.Contains("services.AddScoped(typeof(IInterceptHandler<,>), typeof(TestApp.LoggingInterceptor<,>));", regSrc);
+    }
+
+    [Fact]
+    public void OpenGenericInterceptor_CoexistsWithClosedInterceptor()
+    {
+        var source = ContractsSource + @"
+
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public record GetUserQuery : IQuery<string> { }
+    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    {
+        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
+    }
+    public class GetUserInterceptor : IInterceptHandler<GetUserQuery, string>
+    {
+        public ValueTask<string> HandleAsync(GetUserQuery msg, RequestHandlerDelegate<string> next, CancellationToken ct) => next();
+    }
+    public class LoggingInterceptor<TMessage, TResult> : IInterceptHandler<TMessage, TResult>
+    {
+        public ValueTask<TResult> HandleAsync(TMessage msg, RequestHandlerDelegate<TResult> next, CancellationToken ct) => next();
+    }
+}";
+
+        var (genResult, _) = Run(source);
+        var generated = genResult.Results[0].GeneratedSources;
+
+        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
+
+        // Closed interceptor registered as a concrete pair, open one against the unbound interface.
+        Assert.Contains("services.AddScoped<IInterceptHandler<TestApp.GetUserQuery, string>, TestApp.GetUserInterceptor>();", regSrc);
+        Assert.Contains("services.AddScoped(typeof(IInterceptHandler<,>), typeof(TestApp.LoggingInterceptor<,>));", regSrc);
+
+        // Only a single interceptor list/parameter is emitted for the message.
+        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(dispatcherSrc, "_getUserQueryInterceptors;"));
+    }
+
+    [Fact]
     public void DomainEventHandler_GeneratesRegistration()
     {
         var source = ContractsSource + @"
