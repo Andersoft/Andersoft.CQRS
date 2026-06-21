@@ -74,7 +74,7 @@ public abstract class Saga<TSagaState> : Saga
     protected abstract void ConfigureHowToFindSaga(ISagaPropertyMapper<TSagaState> mapper);
 
     /// <summary>Pre‑loaded saga data. Null only before any event is handled.</summary>
-    protected TSagaState? Data => Accessor is TypedAccessor<TSagaState> a ? a.State : null;
+    protected TSagaState? Data => Accessor is SagaStateAccessor<TSagaState> a ? a.Data : null;
 
     /// <summary>
     /// Maps an event to a saga. Use <c>MapStartedBy</c> for events that can

@@ -9,7 +9,7 @@ namespace Andersoft.CQRS.Abstractions;
 /// Tracks lifecycle: IsNew (just created), IsStarted (state loaded/exists),
 /// and MarkAsComplete (deletes state on next save).
 /// </summary>
-public sealed class SagaStateAccessor<TSagaState>
+public sealed class SagaStateAccessor<TSagaState> : ISagaStateAccessor
     where TSagaState : SagaState, new()
 {
     private readonly ISagaRepository<TSagaState> _repository;
@@ -69,6 +69,14 @@ public sealed class SagaStateAccessor<TSagaState>
     {
         _completed = true;
     }
+
+    // Non-generic bridge for the saga lifecycle (SagaDispatcher works through ISagaStateAccessor).
+    // IsNew/IsStarted/SaveAsync/MarkAsComplete are satisfied implicitly by the members above.
+    async ValueTask<object> ISagaStateAccessor.LoadOrCreateAsync(Guid correlationId, CancellationToken ct)
+        => await LoadOrCreateAsync(correlationId, ct);
+
+    async ValueTask<object?> ISagaStateAccessor.LoadAsync(Guid correlationId, CancellationToken ct)
+        => await LoadAsync(correlationId, ct);
 
     /// <summary>
     /// Persists the current state. If <see cref="MarkAsComplete"/> was called,

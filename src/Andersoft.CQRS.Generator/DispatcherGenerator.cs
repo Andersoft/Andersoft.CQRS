@@ -461,19 +461,6 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         {
             sb.AppendLine();
             sb.AppendLine("    /// <summary>");
-            sb.AppendLine("    /// Registers ISagaRepository&lt;TState&gt; for all saga state types via open‑generic");
-            sb.AppendLine("    /// registration — zero MakeGenericType, fully AOT‑compatible.");
-            sb.AppendLine("    /// </summary>");
-            sb.AppendLine("    public static IServiceCollection AddSagaPersistence<TContext>(this IServiceCollection services)");
-            sb.AppendLine("        where TContext : Microsoft.EntityFrameworkCore.DbContext");
-            sb.AppendLine("    {");
-            sb.AppendLine("        Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddScoped<Microsoft.EntityFrameworkCore.DbContext>(services, sp => sp.GetRequiredService<TContext>());");
-            sb.AppendLine("        Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddScoped(services, typeof(Andersoft.CQRS.Abstractions.ISagaRepository<>), typeof(Andersoft.CQRS.EntityFrameworkCore.EFCoreSagaRepository<>));");
-            sb.AppendLine("        return services;");
-            sb.AppendLine("    }");
-
-            sb.AppendLine();
-            sb.AppendLine("    /// <summary>");
             sb.AppendLine("    /// Maps every saga state type (key on CorrelationId, Version as concurrency token).");
             sb.AppendLine("    /// Call from <c>OnModelCreating</c>.");
             sb.AppendLine("    /// </summary>");

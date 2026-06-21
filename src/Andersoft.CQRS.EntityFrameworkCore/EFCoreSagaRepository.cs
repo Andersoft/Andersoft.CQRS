@@ -14,7 +14,7 @@ namespace Andersoft.CQRS.EntityFrameworkCore;
 /// Single type parameter so it can be registered as an open generic
 /// (<c>ISagaRepository&lt;&gt;</c> → <c>EFCoreSagaRepository&lt;&gt;</c>), which is AOT‑safe.
 /// The concrete <see cref="DbContext"/> is supplied by DI — register it as
-/// <see cref="DbContext"/> via <c>AddSagaRepository&lt;TContext&gt;()</c>.
+/// <see cref="DbContext"/> via <c>AddSagaPersistence&lt;TContext&gt;()</c>.
 /// </remarks>
 public class EFCoreSagaRepository<TState> : ISagaRepository<TState>
     where TState : SagaState

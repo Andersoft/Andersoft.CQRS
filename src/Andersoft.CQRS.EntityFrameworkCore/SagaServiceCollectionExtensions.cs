@@ -19,7 +19,7 @@ public static class SagaServiceCollectionExtensions
     /// type is requested. The concrete <typeparamref name="TContext"/> is exposed as
     /// <see cref="DbContext"/> so the open‑generic repository can depend on it.
     /// </remarks>
-    public static IServiceCollection AddSagaRepository<TContext>(this IServiceCollection services)
+    public static IServiceCollection AddSagaPersistence<TContext>(this IServiceCollection services)
         where TContext : DbContext
     {
         services.TryAddScoped<DbContext>(sp => sp.GetRequiredService<TContext>());
@@ -42,13 +42,11 @@ public static class SagaServiceCollectionExtensions
         where TSaga : Saga<TState>
         where TState : SagaState, new()
     {
-        SagaRegistry.RegisterState(typeof(TState));
         services.AddScoped<TSaga>();
         services.AddScoped<Saga>(sp =>
         {
             var saga = sp.GetRequiredService<TSaga>();
-            saga.Accessor = new TypedAccessor<TState>(
-                new SagaStateAccessor<TState>(sp.GetRequiredService<ISagaRepository<TState>>()));
+            saga.Accessor = new SagaStateAccessor<TState>(sp.GetRequiredService<ISagaRepository<TState>>());
             saga.BuildHandlers();
             return saga;
         });
