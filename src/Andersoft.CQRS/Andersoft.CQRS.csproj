@@ -1,23 +1,38 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>netstandard2.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
-    <IsRoslynComponent>true</IsRoslynComponent>
-    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="2.0.0" />
-    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="4.4.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
     <None Include="build\Andersoft.CQRS.targets" Pack="true" PackagePath="build" />
   </ItemGroup>
 
-  <Target Name="AddAnalyzersToPackage" BeforeTargets="GenerateNuspec">
+  <ItemGroup>
+    <InternalsVisibleTo Include="Andersoft.CQRS.EntityFrameworkCore" />
+  </ItemGroup>
+
+  <!--
+    Build-order dependency on the source generator only. ReferenceOutputAssembly
+    is false so the generator is NOT a runtime reference, and it is deliberately
+    NOT registered as an Analyzer here — running it on this abstractions-only
+    project would emit an empty HandlerRegistration/TypedDispatcher that collides
+    with the consumer's generated types.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\Andersoft.CQRS.Generator\Andersoft.CQRS.Generator.csproj"
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Bundle the source generator so consumers of this package receive it. -->
+  <Target Name="AddGeneratorToPackage" BeforeTargets="GenerateNuspec">
     <ItemGroup>
-      <_PackageFiles Include="$(TargetPath)">
+      <_PackageFiles Include="..\Andersoft.CQRS.Generator\bin\$(Configuration)\netstandard2.0\Andersoft.CQRS.Generator.dll">
         <PackagePath>analyzers/dotnet/cs</PackagePath>
         <BuildAction>None</BuildAction>
       </_PackageFiles>

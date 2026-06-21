@@ -28,12 +28,22 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             .SelectMany<ImmutableArray<HandlerTypeInfo>, HandlerTypeInfo>(static (h, _) => h)
             .Collect();
 
-        var combined = messageTypes.Combine(handlerTypes);
+        // Saga discovery — classes extending Saga<TState>
+        var sagaTypes = context.SyntaxProvider
+            .CreateSyntaxProvider(
+                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                transform: static (ctx, ct) => GetSagaTypes(ctx, ct))
+            .Where(static s => s is not null)
+            .Select(static (s, _) => s!)
+            .Collect();
+
+        var combined = messageTypes.Combine(handlerTypes).Combine(sagaTypes);
 
         context.RegisterSourceOutput(combined, static (spc, pair) =>
         {
-            var messages = pair.Left;
-            var handlers = pair.Right;
+            var messages = pair.Left.Left;
+            var handlers = pair.Left.Right;
+            var sagas = pair.Right;
 
             if (!messages.IsEmpty || handlers.Any(h => h.Kind == HandlerKind.DomainEvent))
             {
@@ -45,9 +55,9 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
                 spc.AddSource("TypedDispatcher.g.cs", SourceText.From(source, Encoding.UTF8));
             }
 
-            if (!handlers.IsEmpty)
+            if (!handlers.IsEmpty || !sagas.IsEmpty)
             {
-                var source = GenerateRegistrationExtension(handlers);
+                var source = GenerateRegistrationExtension(handlers, sagas);
                 spc.AddSource("HandlerRegistration.g.cs", SourceText.From(source, Encoding.UTF8));
             }
         });
@@ -171,6 +181,83 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         }
 
         return results.ToImmutable();
+    }
+
+    private static SagaInfo? GetSagaTypes(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
+    {
+        var classDecl = (ClassDeclarationSyntax)context.Node;
+        var model = context.SemanticModel;
+
+        if (model.GetDeclaredSymbol(classDecl, ct) is not INamedTypeSymbol classSymbol)
+            return null;
+
+        // Walk the base type chain looking for Saga<TState>
+        var baseType = classSymbol.BaseType;
+        INamedTypeSymbol? sagaBase = null;
+        while (baseType is not null)
+        {
+            if (baseType.IsGenericType && baseType.ConstructedFrom.ToDisplayString() == "Andersoft.CQRS.Abstractions.Saga<TState>")
+            {
+                sagaBase = baseType;
+                break;
+            }
+            baseType = baseType.BaseType;
+        }
+
+        if (sagaBase is null) return null;
+
+        var stateType = sagaBase.TypeArguments[0].ToDisplayString();
+        var info = new SagaInfo(classSymbol.ToDisplayString(), stateType);
+
+        // Extract event types from ConfigureHowToFindSaga override
+        foreach (var member in classSymbol.GetMembers())
+        {
+            if (member is not IMethodSymbol method) continue;
+            if (method.Name != "ConfigureHowToFindSaga") continue;
+            if (method.MethodKind != MethodKind.Ordinary) continue;
+
+            foreach (var syntaxRef in method.DeclaringSyntaxReferences)
+            {
+                var methodSyntax = syntaxRef.GetSyntax(ct) as MethodDeclarationSyntax;
+                if (methodSyntax?.Body is null) continue;
+
+                foreach (var statement in methodSyntax.Body.DescendantNodes())
+                {
+                    if (statement is not InvocationExpressionSyntax invocation) continue;
+
+                    var expr = invocation.Expression.ToString();
+                    if (expr.Contains("MapStartedBy"))
+                    {
+                        ExtractEventType(invocation, info.StartedByEventTypes);
+                    }
+                    else if (expr.Contains("MapHandledBy"))
+                    {
+                        ExtractEventType(invocation, info.HandledByEventTypes);
+                    }
+                }
+            }
+        }
+
+        return info;
+    }
+
+    private static void ExtractEventType(InvocationExpressionSyntax invocation, List<string> eventTypes)
+    {
+        // MapStartedBy<TEvent>(...) — extract TEvent from generic args
+        if (invocation.Expression is GenericNameSyntax generic)
+        {
+            var typeArg = generic.TypeArgumentList.Arguments.FirstOrDefault()?.ToString();
+            if (typeArg is not null)
+                eventTypes.Add(typeArg);
+        }
+        // Also try member access like m.MapStartedBy<TEvent>(...)
+        else if (invocation.Expression is MemberAccessExpressionSyntax ma
+                 && ma.Name is GenericNameSyntax maGeneric)
+        {
+            var typeArg = maGeneric.TypeArgumentList.Arguments.FirstOrDefault()?.ToString();
+            if (typeArg is not null)
+                eventTypes.Add(typeArg);
+        }
     }
 
     private static string GenerateTypedDispatcher(
@@ -422,8 +509,12 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         return sb.ToString();
     }
 
-    private static string GenerateRegistrationExtension(ImmutableArray<HandlerTypeInfo> handlers)
+    private static string GenerateRegistrationExtension(
+        ImmutableArray<HandlerTypeInfo> handlers,
+        ImmutableArray<SagaInfo> sagas)
     {
+        var hasSagas = !sagas.IsEmpty;
+
         var sb = new StringBuilder();
         sb.AppendLine("// <auto-generated />");
         sb.AppendLine("#nullable enable");
@@ -431,6 +522,7 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine("using Microsoft.Extensions.DependencyInjection;");
         sb.AppendLine("using Andersoft.CQRS;");
         sb.AppendLine("using Andersoft.CQRS.Abstractions;");
+        if (hasSagas) sb.AppendLine("using Andersoft.CQRS.EntityFrameworkCore;");
         sb.AppendLine();
         sb.AppendLine("namespace Andersoft.CQRS;");
         sb.AppendLine();
@@ -441,9 +533,6 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
 
         foreach (var handler in handlers)
         {
-            // Open generic interceptors register against the unbound interface so the container can
-            // close them per message type (and honour any generic constraints) when resolving the
-            // IEnumerable<IInterceptHandler<TMessage, TResult>> the dispatcher requests.
             if (handler.IsOpenGeneric)
             {
                 sb.AppendLine($"        services.AddScoped(typeof(IInterceptHandler<,>), typeof({handler.HandlerType}));");
@@ -461,9 +550,55 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             sb.AppendLine($"        services.AddScoped<{interfaceType}, {handler.HandlerType}>();");
         }
 
+        if (hasSagas)
+        {
+            sb.AppendLine();
+            sb.AppendLine("        // Auto-discovered sagas");
+            foreach (var saga in sagas)
+            {
+                sb.AppendLine($"        services.AddSaga<{saga.SagaType}, {saga.StateType}>();");
+            }
+
+            // Inline dispatcher registrations (AOT-compatible — no MakeGenericType)
+            var allEventTypes = new HashSet<string>();
+            foreach (var saga in sagas)
+            {
+                foreach (var et in saga.StartedByEventTypes) allEventTypes.Add(et);
+                foreach (var et in saga.HandledByEventTypes) allEventTypes.Add(et);
+            }
+
+            if (allEventTypes.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("        // Auto-discovered saga dispatchers");
+                foreach (var eventType in allEventTypes)
+                {
+                    sb.AppendLine($"        services.AddScoped<IDomainEventHandler<{eventType}>>(sp =>");
+                    sb.AppendLine($"            new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<{eventType}>(");
+                    sb.AppendLine($"                sp.GetRequiredService<System.Collections.Generic.IEnumerable<Andersoft.CQRS.Abstractions.Saga>>()));");
+                }
+            }
+        }
+
         sb.AppendLine("        services.AddScoped<TypedDispatcher>();");
         sb.AppendLine("        return services;");
         sb.AppendLine("    }");
+
+        if (hasSagas)
+        {
+            sb.AppendLine();
+            sb.AppendLine("    /// <summary>");
+            sb.AppendLine("    /// Registers ISagaRepository&lt;TState&gt; for all saga state types via open‑generic");
+            sb.AppendLine("    /// registration — zero MakeGenericType, fully AOT‑compatible.");
+            sb.AppendLine("    /// </summary>");
+            sb.AppendLine("    public static IServiceCollection AddSagaPersistence<TContext>(this IServiceCollection services)");
+            sb.AppendLine("        where TContext : Microsoft.EntityFrameworkCore.DbContext");
+            sb.AppendLine("    {");
+            sb.AppendLine("        Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddScoped<Microsoft.EntityFrameworkCore.DbContext>(services, sp => sp.GetRequiredService<TContext>());");
+            sb.AppendLine("        Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddScoped(services, typeof(Andersoft.CQRS.Abstractions.ISagaRepository<>), typeof(Andersoft.CQRS.EntityFrameworkCore.EFCoreSagaRepository<>));");
+            sb.AppendLine("        return services;");
+            sb.AppendLine("    }");
+        }
         sb.AppendLine("}");
 
         return sb.ToString();
@@ -531,4 +666,13 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
 
     private enum MessageKind { Query, Command }
     private enum HandlerKind { Query, Command, DomainEvent, Interceptor }
+
+    private sealed class SagaInfo
+    {
+        public string SagaType { get; }
+        public string StateType { get; }
+        public List<string> StartedByEventTypes { get; } = new();
+        public List<string> HandledByEventTypes { get; } = new();
+        public SagaInfo(string sagaType, string stateType) { SagaType = sagaType; StateType = stateType; }
+    }
 }

@@ -1,6 +1,11 @@
 <Solution>
+  <Folder Name="/SolutionFolder/">
+    <File Path="Directory.Build.props" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Andersoft.CQRS/Andersoft.CQRS.csproj" />
+    <Project Path="src/Andersoft.CQRS.Generator/Andersoft.CQRS.Generator.csproj" />
+    <Project Path="src/Andersoft.CQRS.EntityFrameworkCore/Andersoft.CQRS.EntityFrameworkCore.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Andersoft.CQRS.Tests/Andersoft.CQRS.Tests.csproj" />
