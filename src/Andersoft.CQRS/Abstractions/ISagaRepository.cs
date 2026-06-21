@@ -1,11 +1,13 @@
 using System;
+using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Andersoft.CQRS.Abstractions;
 
 /// <summary>
-/// Persists and retrieves saga state keyed by <see cref="SagaState.CorrelationId"/>.
+/// Persists and retrieves saga state. Events are correlated to an instance by a predicate over
+/// saga-state fields (built from <c>MapStartedBy</c>/<c>MapHandledBy</c>) rather than a fixed key.
 /// Implementations are responsible for optimistic concurrency (typically via
 /// <see cref="SagaState.Version"/>).
 /// </summary>
@@ -14,11 +16,11 @@ public interface ISagaRepository<TState>
     where TState : SagaState
 {
     /// <summary>
-    /// Loads the saga state for the given correlation ID.
+    /// Loads the single saga state matching <paramref name="match"/>.
     /// Returns <c>null</c> if no saga exists — typically means the saga hasn't
     /// been created yet and the current event is the initial event.
     /// </summary>
-    ValueTask<TState?> LoadAsync(Guid correlationId, CancellationToken ct = default);
+    ValueTask<TState?> LoadAsync(Expression<Func<TState, bool>> match, CancellationToken ct = default);
 
     /// <summary>
     /// Persists the saga state. Implementations must handle both insert (new saga)

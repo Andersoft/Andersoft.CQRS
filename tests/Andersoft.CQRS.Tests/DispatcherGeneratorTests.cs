@@ -34,7 +34,7 @@ namespace Andersoft.CQRS.Abstractions
     public interface IInterceptHandler<in TMessage, TResult> { ValueTask<TResult> HandleAsync(TMessage message, RequestHandlerDelegate<TResult> next, CancellationToken ct); }
     public interface IInterceptHandler<in TMessage> { ValueTask HandleAsync(TMessage message, RequestHandlerDelegate next, CancellationToken ct); }
 
-    public abstract class SagaState { public Guid CorrelationId { get; set; } public uint Version { get; set; } }
+    public abstract class SagaState { public Guid Id { get; set; } public uint Version { get; set; } }
 
     // Only the non-generic Saga base is part of the library surface. The generic Saga<TState>
     // that concrete sagas extend is emitted by the generator (post-initialization), so it is NOT
@@ -255,7 +255,7 @@ namespace TestApp
     public record NodeStarted(Guid ExecutionId);
     public record NodeCompleted(Guid ExecutionId);
 
-    public sealed class WorkflowState : SagaState { }
+    public sealed class WorkflowState : SagaState { public Guid ExecutionId { get; set; } }
 
     // No `partial` — the generated Saga<TState> base carries the dispatcher.
     public sealed class WorkflowSaga
@@ -263,8 +263,8 @@ namespace TestApp
     {
         protected override void ConfigureHowToFindSaga(ISagaPropertyMapper<WorkflowState> m)
         {
-            m.MapStartedBy<NodeStarted>(e => e.ExecutionId);
-            m.MapHandledBy<NodeCompleted>(e => e.ExecutionId);
+            m.MapStartedBy<NodeStarted, Guid>(e => e.ExecutionId, s => s.ExecutionId);
+            m.MapHandledBy<NodeCompleted, Guid>(e => e.ExecutionId, s => s.ExecutionId);
         }
         public ValueTask HandleAsync(NodeStarted message, CancellationToken ct = default) => default;
         public ValueTask HandleAsync(NodeCompleted message, CancellationToken ct = default) => default;
@@ -286,9 +286,14 @@ namespace TestApp
         // Saga events appear as void messages in the dispatcher.
         Assert.Contains("InvokeAll(_nodeStartedHandlers, message, ct);", generated.Dispatcher);
 
-        // EF model config for the state type is generated for OnModelCreating.
+        // EF model config for the state type is generated for OnModelCreating, with a unique index
+        // on each correlation field discovered from the MapStartedBy/MapHandledBy selectors.
         Assert.Contains("public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(", generated.Registration);
         Assert.Contains("modelBuilder.ConfigureSagaState<TestApp.WorkflowState>();", generated.Registration);
+        Assert.Contains("modelBuilder.Entity<TestApp.WorkflowState>().HasIndex(static x => x.ExecutionId).IsUnique();", generated.Registration);
+
+        // The mapper exposes the state-field correlation API (event key + saga-state selector).
+        Assert.Contains("void MapStartedBy<TEvent, TKey>(Func<TEvent, TKey> messageKey, Expression<Func<TState, TKey>> sagaKey);", generated.SagaBase);
 
         // The generated Saga<TState> base (always emitted) carries a deferred dispatcher factory that
         // the configure callback wires up, plus a lazy Dispatcher getter — no `partial` required on
@@ -324,7 +329,10 @@ namespace TestApp
         var syntaxTree = CSharpSyntaxTree.ParseText(source, ParseOptions);
 
         var references = ImmutableArray.Create<MetadataReference>(
-            MetadataReference.CreateFromFile(typeof(object).Assembly.Location));
+            MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+            // The generated Saga<TState> mapper references Expression<> (System.Linq.Expressions), so
+            // the saga and its MapStartedBy/MapHandledBy calls bind and their type args resolve.
+            MetadataReference.CreateFromFile(typeof(System.Linq.Expressions.Expression).Assembly.Location));
 
         var compilation = CSharpCompilation.Create(
             "TestAssembly",

@@ -77,6 +77,7 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
 namespace Andersoft.CQRS.Abstractions
 {
     using System;
+    using System.Linq.Expressions;
 
     /// <summary>
     /// Typed saga base. Concrete sagas extend this and register correlations via
@@ -90,9 +91,10 @@ namespace Andersoft.CQRS.Abstractions
         /// <summary>
         /// Override to register event handlers and correlation mappings. Called once per saga type
         /// during registration. Map an event with <c>MapStartedBy</c> if it can create a new saga
-        /// instance, or <c>MapHandledBy</c> if it requires an existing one; the handler is the
-        /// saga's <c>IMessageHandler&lt;TEvent&gt;.HandleAsync</c> implementation, bound
-        /// automatically. State is available via the <see cref=""Data"" /> property.
+        /// instance, or <c>MapHandledBy</c> if it requires an existing one. Each mapping correlates an
+        /// event key to a saga-state field; the handler is the saga's
+        /// <c>IMessageHandler&lt;TEvent&gt;.HandleAsync</c> implementation, bound automatically. State is
+        /// available via the <see cref=""Data"" /> property.
         /// </summary>
         protected abstract void ConfigureHowToFindSaga(ISagaPropertyMapper<TSagaState> mapper);
 
@@ -115,16 +117,19 @@ namespace Andersoft.CQRS.Abstractions
         /// </summary>
         protected internal global::Andersoft.CQRS.TypedDispatcher Dispatcher => DispatcherFactory();
 
-        /// <summary>Maps an event to a saga via its correlation id.</summary>
-        protected interface ISagaPropertyMapper<out TState>
+        /// <summary>Correlates events to a saga instance by matching an event key against a saga-state field.</summary>
+        protected interface ISagaPropertyMapper<TState>
         {
-            /// <summary>Maps <typeparamref name=""TEvent"" /> to a correlation id for an event that
-            /// can START a new saga instance (created if none is found).</summary>
-            void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation);
+            /// <summary>Correlates <typeparamref name=""TEvent"" /> for an event that can START a new saga
+            /// instance: the instance is found by matching <paramref name=""sagaKey"" /> against
+            /// <paramref name=""messageKey"" />, or created with that field initialized when none is found.
+            /// <paramref name=""sagaKey"" /> must be a simple property or field.</summary>
+            void MapStartedBy<TEvent, TKey>(Func<TEvent, TKey> messageKey, Expression<Func<TState, TKey>> sagaKey);
 
-            /// <summary>Maps <typeparamref name=""TEvent"" /> to a correlation id for an event that
-            /// goes to an EXISTING saga instance (discarded if none is found).</summary>
-            void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation);
+            /// <summary>Correlates <typeparamref name=""TEvent"" /> for an event that goes to an EXISTING saga
+            /// instance (discarded if none is found): the instance is found by matching
+            /// <paramref name=""sagaKey"" /> against <paramref name=""messageKey"" />.</summary>
+            void MapHandledBy<TEvent, TKey>(Func<TEvent, TKey> messageKey, Expression<Func<TState, TKey>> sagaKey);
         }
 
         protected override void BuildHandlers() => ConfigureHowToFindSaga(new Mapper(this));
@@ -134,11 +139,11 @@ namespace Andersoft.CQRS.Abstractions
             private readonly Saga<TSagaState> _saga;
             public Mapper(Saga<TSagaState> saga) => _saga = saga;
 
-            public void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation)
-                => _saga.RegisterSagaHandler<TEvent>(correlation, isStartedBy: true);
+            public void MapStartedBy<TEvent, TKey>(Func<TEvent, TKey> messageKey, Expression<Func<TSagaState, TKey>> sagaKey)
+                => _saga.RegisterSagaHandler<TEvent, TKey>(messageKey, sagaKey, isStartedBy: true);
 
-            public void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation)
-                => _saga.RegisterSagaHandler<TEvent>(correlation, isStartedBy: false);
+            public void MapHandledBy<TEvent, TKey>(Func<TEvent, TKey> messageKey, Expression<Func<TSagaState, TKey>> sagaKey)
+                => _saga.RegisterSagaHandler<TEvent, TKey>(messageKey, sagaKey, isStartedBy: false);
         }
     }
 }
@@ -252,12 +257,22 @@ namespace Andersoft.CQRS.Abstractions
                     var expr = inv.Expression.ToString();
                     if (!expr.Contains("MapStartedBy") && !expr.Contains("MapHandledBy")) continue;
 
-                    // Resolve the generic argument semantically so the event type is
-                    // fully qualified — the generated registration has no per-feature usings.
+                    // Resolve the type arguments semantically so the event type is fully qualified —
+                    // the generated registration has no per-feature usings. TEvent is the first of the
+                    // two type arguments (<TEvent, TKey>).
                     if (context.SemanticModel.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m
-                        && m.TypeArguments.Length == 1)
+                        && m.TypeArguments.Length >= 1)
                     {
                         info.EventTypes.Add(m.TypeArguments[0].ToDisplayString());
+                    }
+
+                    // The second argument is the saga-key selector (s => s.Field). Capture the field
+                    // name so a unique index can be emitted for it. Only direct member access on the
+                    // lambda parameter yields an indexable field; anything else is skipped.
+                    if (inv.ArgumentList.Arguments.Count >= 2 &&
+                        ExtractSimpleMemberName(inv.ArgumentList.Arguments[1].Expression) is { } field)
+                    {
+                        info.KeyFields.Add(field);
                     }
                 }
             }
@@ -557,13 +572,18 @@ namespace Andersoft.CQRS.Abstractions
         {
             sb.AppendLine();
             sb.AppendLine("    /// <summary>");
-            sb.AppendLine("    /// Maps every saga state type (key on CorrelationId, Version as concurrency token).");
+            sb.AppendLine("    /// Maps every saga state type (key on Id, Version as concurrency token) and adds a unique");
+            sb.AppendLine("    /// index for each correlation field used in <c>ConfigureHowToFindSaga</c>.");
             sb.AppendLine("    /// Call from <c>OnModelCreating</c>.");
             sb.AppendLine("    /// </summary>");
             sb.AppendLine("    public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(this Microsoft.EntityFrameworkCore.ModelBuilder modelBuilder)");
             sb.AppendLine("    {");
-            foreach (var stateType in sagas.Select(s => s.StateType).Distinct())
-                sb.AppendLine($"        modelBuilder.ConfigureSagaState<{stateType}>();");
+            foreach (var group in sagas.GroupBy(s => s.StateType))
+            {
+                sb.AppendLine($"        modelBuilder.ConfigureSagaState<{group.Key}>();");
+                foreach (var field in group.SelectMany(s => s.KeyFields).Distinct())
+                    sb.AppendLine($"        modelBuilder.Entity<{group.Key}>().HasIndex(static x => x.{field}).IsUnique();");
+            }
             sb.AppendLine("        return modelBuilder;");
             sb.AppendLine("    }");
         }
@@ -586,9 +606,30 @@ namespace Andersoft.CQRS.Abstractions
             var info = new SagaInfo(group.Key, group.First().StateType);
             foreach (var ev in group.SelectMany(s => s.EventTypes).Distinct())
                 info.EventTypes.Add(ev);
+            foreach (var field in group.SelectMany(s => s.KeyFields).Distinct())
+                info.KeyFields.Add(field);
             merged.Add(info);
         }
         return merged;
+    }
+
+    /// <summary>
+    /// Extracts the field name from a simple saga-key selector — <c>s =&gt; s.Field</c> yields
+    /// <c>Field</c>. Returns null for anything that is not a direct member access on the lambda
+    /// parameter (nested access, method calls, etc.), which cannot back a unique index.
+    /// </summary>
+    private static string? ExtractSimpleMemberName(ExpressionSyntax expression)
+    {
+        var body = expression switch
+        {
+            SimpleLambdaExpressionSyntax s => s.Body,
+            ParenthesizedLambdaExpressionSyntax p => p.Body,
+            _ => null,
+        };
+
+        return body is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax } ma
+            ? ma.Name.Identifier.Text
+            : null;
     }
 
     private static string ToCamelCase(string s)
@@ -644,6 +685,9 @@ namespace Andersoft.CQRS.Abstractions
         public string SagaType { get; }
         public string StateType { get; }
         public List<string> EventTypes { get; } = new();
+
+        /// <summary>Saga-state field names used as correlation keys; each gets a unique index.</summary>
+        public List<string> KeyFields { get; } = new();
 
         public SagaInfo(string sagaType, string stateType)
         {

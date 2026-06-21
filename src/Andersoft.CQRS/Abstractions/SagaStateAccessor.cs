@@ -1,4 +1,5 @@
 using System;
+using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -33,12 +34,17 @@ public sealed class SagaStateAccessor<TSagaState> : ISagaStateAccessor
     public bool IsCompleted => _completed;
 
     /// <summary>
-    /// Loads existing state or creates a new one with the given correlation ID.
-    /// Sets <see cref="IsNew"/> to true when a new instance is created.
+    /// Loads the instance matching <paramref name="match"/>, or creates a new one and runs
+    /// <paramref name="initialize"/> against it (to set the mapped correlation field). Sets
+    /// <see cref="IsNew"/> to true when a new instance is created. The <c>Id</c> primary key is
+    /// store-generated, so it is left unset here and assigned on the first <see cref="SaveAsync"/>.
     /// </summary>
-    public async ValueTask<TSagaState> LoadOrCreateAsync(Guid correlationId, CancellationToken ct = default)
+    public async ValueTask<TSagaState> LoadOrCreateAsync(
+        Expression<Func<TSagaState, bool>> match,
+        Action<TSagaState> initialize,
+        CancellationToken ct = default)
     {
-        var existing = await _repository.LoadAsync(correlationId, ct);
+        var existing = await _repository.LoadAsync(match, ct);
         if (existing is not null)
         {
             Data = existing;
@@ -46,17 +52,20 @@ public sealed class SagaStateAccessor<TSagaState> : ISagaStateAccessor
             return existing;
         }
 
-        Data = new TSagaState { CorrelationId = correlationId };
+        Data = new TSagaState();
+        initialize(Data);
         IsNew = true;
         return Data;
     }
 
     /// <summary>
-    /// Loads existing state by correlation ID. Returns null if none exists.
+    /// Loads existing state matching <paramref name="match"/>. Returns null if none exists.
     /// </summary>
-    public async ValueTask<TSagaState?> LoadAsync(Guid correlationId, CancellationToken ct = default)
+    public async ValueTask<TSagaState?> LoadAsync(
+        Expression<Func<TSagaState, bool>> match,
+        CancellationToken ct = default)
     {
-        Data = await _repository.LoadAsync(correlationId, ct);
+        Data = await _repository.LoadAsync(match, ct);
         IsNew = false;
         return Data;
     }
@@ -72,11 +81,13 @@ public sealed class SagaStateAccessor<TSagaState> : ISagaStateAccessor
 
     // Non-generic bridge for the saga lifecycle (SagaDispatcher works through ISagaStateAccessor).
     // IsNew/IsStarted/SaveAsync/MarkAsComplete are satisfied implicitly by the members above.
-    async ValueTask<object> ISagaStateAccessor.LoadOrCreateAsync(Guid correlationId, CancellationToken ct)
-        => await LoadOrCreateAsync(correlationId, ct);
+    // The non-generic match expression is the Expression<Func<TSagaState, bool>> built by the
+    // saga's registration, so the cast always succeeds.
+    async ValueTask<object> ISagaStateAccessor.LoadOrCreateAsync(LambdaExpression match, Action<object> initialize, CancellationToken ct)
+        => await LoadOrCreateAsync((Expression<Func<TSagaState, bool>>)match, s => initialize(s), ct);
 
-    async ValueTask<object?> ISagaStateAccessor.LoadAsync(Guid correlationId, CancellationToken ct)
-        => await LoadAsync(correlationId, ct);
+    async ValueTask<object?> ISagaStateAccessor.LoadAsync(LambdaExpression match, CancellationToken ct)
+        => await LoadAsync((Expression<Func<TSagaState, bool>>)match, ct);
 
     /// <summary>
     /// Persists the current state. If <see cref="MarkAsComplete"/> was called,

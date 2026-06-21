@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -25,8 +27,9 @@ namespace Andersoft.CQRS.Abstractions;
 /// {
 ///     protected override void ConfigureHowToFindSaga(ISagaPropertyMapper&lt;OrderSagaState&gt; m)
 ///     {
-///         m.MapStartedBy&lt;StartOrder&gt;(e => e.OrderId);
-///         m.MapHandledBy&lt;CompleteOrder&gt;(e => e.OrderId);
+///         // Correlate by matching an event key against a saga-state field.
+///         m.MapStartedBy&lt;StartOrder, Guid&gt;(e => e.OrderId, s => s.OrderId);
+///         m.MapHandledBy&lt;CompleteOrder, Guid&gt;(e => e.OrderId, s => s.OrderId);
 ///     }
 ///
 ///     public ValueTask HandleAsync(StartOrder e, CancellationToken ct)
@@ -72,12 +75,24 @@ public abstract class Saga
     /// generated saga base's mapper — it lives here so <see cref="SagaHandlerRegistration"/> can stay
     /// internal to this assembly rather than being constructed in generated consumer code.
     /// </summary>
+    /// <param name="messageKey">Extracts the correlation key from the event.</param>
+    /// <param name="sagaKey">
+    /// Selects the saga-state field to match the key against (an <c>Expression&lt;Func&lt;TState, TKey&gt;&gt;</c>,
+    /// typed here as <see cref="LambdaExpression"/>). The expression is composed into an EF find-predicate;
+    /// for a started-by mapping it must be a simple property/field so the new instance can be initialized.
+    /// </param>
     /// <remarks>
-    /// Binds the handler with a plain generic-interface type check. No reflection, GetMethod, or
-    /// CreateDelegate — fully AOT/trim-safe. State is reached via the saga's Data property, so the
-    /// handler takes no state parameter.
+    /// The handler is bound with a plain generic-interface type check — no GetMethod or CreateDelegate.
+    /// The find-predicate is built by composing the supplied expression tree (translated by the repository,
+    /// not compiled at runtime). Started-by initialization assigns the field via the member captured from
+    /// <paramref name="sagaKey"/> — the only reflection on this path, and the chosen trade-off for the
+    /// single-selector mapper API. State is reached via the saga's Data property, so the handler takes no
+    /// state parameter.
     /// </remarks>
-    protected internal void RegisterSagaHandler<TEvent>(Func<TEvent, Guid> correlation, bool isStartedBy)
+    protected internal void RegisterSagaHandler<TEvent, TKey>(
+        Func<TEvent, TKey> messageKey,
+        LambdaExpression sagaKey,
+        bool isStartedBy)
     {
         if (this is not IMessageHandler<TEvent> handler)
         {
@@ -87,11 +102,50 @@ public abstract class Saga
                 $"'ValueTask HandleAsync({typeof(TEvent).Name} message, CancellationToken ct)' method.");
         }
 
+        var stateParam = sagaKey.Parameters[0];
+        var keyBody = sagaKey.Body;
+        var member = (keyBody as MemberExpression)?.Member;
+
+        if (isStartedBy && member is null)
+        {
+            throw new InvalidOperationException(
+                $"Saga '{GetType().Name}' maps '{typeof(TEvent).Name}' with MapStartedBy using a saga key " +
+                $"that is not a simple property or field. A started-by mapping must target a settable member " +
+                $"so a new instance can be initialized with the correlation value.");
+        }
+
         Handlers[typeof(TEvent)] = new SagaHandlerRegistration
         {
             IsStartedBy = isStartedBy,
-            GetCorrelationId = e => correlation((TEvent)e),
+            BuildPredicate = e =>
+            {
+                var value = messageKey((TEvent)e);
+                // Wrap the value in a closure (rather than Expression.Constant) so the repository can
+                // parameterize the query and reuse its compiled plan across keys.
+                Expression<Func<TKey>> valueExpr = () => value;
+                var body = Expression.Equal(keyBody, valueExpr.Body);
+                return Expression.Lambda(body, stateParam);
+            },
+            InitializeState = isStartedBy
+                ? (state, e) => SetMember(member!, state, messageKey((TEvent)e))
+                : null,
             Handler = (e, _, ct) => handler.HandleAsync((TEvent)e, ct),
         };
+    }
+
+    private static void SetMember(MemberInfo member, object target, object? value)
+    {
+        switch (member)
+        {
+            case PropertyInfo p:
+                p.SetValue(target, value);
+                break;
+            case FieldInfo f:
+                f.SetValue(target, value);
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"Cannot assign a saga correlation value to member '{member.Name}'.");
+        }
     }
 }

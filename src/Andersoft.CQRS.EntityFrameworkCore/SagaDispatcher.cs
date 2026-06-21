@@ -28,17 +28,18 @@ public sealed class SagaDispatcher<TEvent> : Andersoft.CQRS.Abstractions.IMessag
             if (!saga.Handlers.TryGetValue(typeof(TEvent), out var reg))
                 continue;
 
-            var correlationId = reg.GetCorrelationId(domainEvent!);
+            var match = reg.BuildPredicate(domainEvent!);
 
             if (reg.IsStartedBy)
             {
-                var state = await saga.Accessor.LoadOrCreateAsync(correlationId, ct);
+                var state = await saga.Accessor.LoadOrCreateAsync(
+                    match, s => reg.InitializeState!(s, domainEvent!), ct);
                 await reg.Handler(domainEvent!, state, ct);
                 await saga.Accessor.SaveAsync(ct);
             }
             else
             {
-                var state = await saga.Accessor.LoadAsync(correlationId, ct);
+                var state = await saga.Accessor.LoadAsync(match, ct);
                 if (!saga.IsStarted) return;
                 await reg.Handler(domainEvent!, state!, ct);
                 await saga.Accessor.SaveAsync(ct);

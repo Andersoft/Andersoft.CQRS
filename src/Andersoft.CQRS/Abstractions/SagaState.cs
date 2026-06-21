@@ -8,10 +8,12 @@ namespace Andersoft.CQRS.Abstractions;
 public abstract class SagaState
 {
     /// <summary>
-    /// Uniquely identifies this saga instance. Events are routed to a saga
-    /// by matching their correlation property to this value.
+    /// Surrogate primary key identifying this saga instance. Store-generated on insert;
+    /// it is <em>not</em> used to route events. Events are correlated to an instance by
+    /// matching their key to a saga-state field declared in <c>ConfigureHowToFindSaga</c>
+    /// (see <c>MapStartedBy</c>/<c>MapHandledBy</c>), each of which is backed by a unique index.
     /// </summary>
-    public Guid CorrelationId { get; set; }
+    public Guid Id { get; set; }
 
     /// <summary>
     /// Optimistic concurrency token. Incremented on each save.

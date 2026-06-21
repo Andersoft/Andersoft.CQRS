@@ -1,4 +1,5 @@
 using System;
+using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Andersoft.CQRS.Abstractions;
@@ -26,11 +27,11 @@ public class EFCoreSagaRepository<TState> : ISagaRepository<TState>
         _context = context;
     }
 
-    public async ValueTask<TState?> LoadAsync(Guid correlationId, CancellationToken ct = default)
+    public async ValueTask<TState?> LoadAsync(Expression<Func<TState, bool>> match, CancellationToken ct = default)
     {
         return await _context.Set<TState>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(s => s.CorrelationId == correlationId, ct);
+            .FirstOrDefaultAsync(match, ct);
     }
 
     public async ValueTask SaveAsync(TState state, CancellationToken ct = default)
