@@ -28,13 +28,19 @@ jobs:
           echo "Computed version: $VERSION"
 
       - name: Restore
-        run: dotnet restore src/Andersoft.CQRS
+        run: |
+          dotnet restore src/Andersoft.CQRS
+          dotnet restore src/Andersoft.CQRS.EntityFrameworkCore
 
       - name: Build
-        run: dotnet build src/Andersoft.CQRS --configuration Release --no-restore
+        run: |
+          dotnet build src/Andersoft.CQRS --configuration Release --no-restore -p:Version=${{ env.VERSION }}
+          dotnet build src/Andersoft.CQRS.EntityFrameworkCore --configuration Release --no-restore -p:Version=${{ env.VERSION }}
 
       - name: Pack
-        run: dotnet pack src/Andersoft.CQRS --configuration Release --no-build --output ./nupkgs -p:Version=${{ env.VERSION }}
+        run: |
+          dotnet pack src/Andersoft.CQRS --configuration Release --no-build --output ./nupkgs -p:Version=${{ env.VERSION }}
+          dotnet pack src/Andersoft.CQRS.EntityFrameworkCore --configuration Release --no-build --output ./nupkgs -p:Version=${{ env.VERSION }}
 
       - name: Publish to GitHub Packages
         run: >
