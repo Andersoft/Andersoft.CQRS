@@ -26,4 +26,32 @@ public static class SagaServiceCollectionExtensions
         services.TryAddScoped(typeof(ISagaRepository<>), typeof(EFCoreSagaRepository<>));
         return services;
     }
+
+    /// <summary>
+    /// Registers <typeparamref name="TSaga"/> as a coordinator. The saga becomes resolvable in the
+    /// <c>IEnumerable&lt;Saga&gt;</c> that <see cref="SagaDispatcher{TEvent}"/> fans out to, with its
+    /// state accessor wired (over <see cref="ISagaRepository{TState}"/>) and its correlation handlers
+    /// built from <c>ConfigureHowToFindSaga</c>.
+    /// </summary>
+    /// <remarks>
+    /// Lives here (not in the generated registration) because it sets the <c>internal</c>
+    /// <c>Saga.Accessor</c> and calls the <c>internal</c> <c>BuildHandlers()</c> — accessible via
+    /// <c>InternalsVisibleTo</c>, which the consumer's generated code does not have.
+    /// </remarks>
+    public static IServiceCollection AddSaga<TSaga, TState>(this IServiceCollection services)
+        where TSaga : Saga<TState>
+        where TState : SagaState, new()
+    {
+        SagaRegistry.RegisterState(typeof(TState));
+        services.AddScoped<TSaga>();
+        services.AddScoped<Saga>(sp =>
+        {
+            var saga = sp.GetRequiredService<TSaga>();
+            saga.Accessor = new TypedAccessor<TState>(
+                new SagaStateAccessor<TState>(sp.GetRequiredService<ISagaRepository<TState>>()));
+            saga.BuildHandlers();
+            return saga;
+        });
+        return services;
+    }
 }

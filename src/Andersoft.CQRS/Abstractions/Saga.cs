@@ -32,9 +32,17 @@ public abstract class Saga
 /// Typed saga base. Concrete sagas extend this and register handlers via
 /// <see cref="ConfigureHowToFindSaga"/>.
 ///
-/// Usage — ZERO boilerplate, no IDomainEventHandler, no load/save calls:
+/// A saga is a coordinator over a grouping of message handlers — it implements
+/// <see cref="IMessageHandler{TEvent}"/> for each event it handles and registers only
+/// the correlation in <see cref="ConfigureHowToFindSaga"/>. It is never dispatched to
+/// directly; the generated registration wires a <see cref="SagaDispatcher{TEvent}"/>
+/// onto each event's handler fan-out, which loads state, finds the correlated saga,
+/// invokes its handler, and saves.
 /// <code>
-/// public sealed class OrderSaga : Saga&lt;OrderSagaState&gt;
+/// public sealed class OrderSaga
+///     : Saga&lt;OrderSagaState&gt;,
+///       IMessageHandler&lt;StartOrder&gt;,
+///       IMessageHandler&lt;CompleteOrder&gt;
 /// {
 ///     protected override void ConfigureHowToFindSaga(ISagaPropertyMapper&lt;OrderSagaState&gt; m)
 ///     {
@@ -42,13 +50,13 @@ public abstract class Saga
 ///         m.MapHandledBy&lt;CompleteOrder&gt;(e => e.OrderId);
 ///     }
 ///
-///     public ValueTask Handle(StartOrder e, CancellationToken ct)
+///     public ValueTask HandleAsync(StartOrder e, CancellationToken ct)
 ///     {
 ///         if (IsNew) Data.CustomerId = e.CustomerId;
 ///         return default;
 ///     }
 ///
-///     public ValueTask Handle(CompleteOrder e, CancellationToken ct)
+///     public ValueTask HandleAsync(CompleteOrder e, CancellationToken ct)
 ///     {
 ///         MarkAsComplete();
 ///         return default;
@@ -72,21 +80,30 @@ public abstract class Saga<TSagaState> : Saga
     /// Maps an event to a saga. Use <c>MapStartedBy</c> for events that can
     /// create a new saga instance; <c>MapHandledBy</c> for events that require
     /// an existing saga.
+    ///
+    /// You only register the correlation here — the handler is the saga's
+    /// <see cref="IMessageHandler{TEvent}.HandleAsync"/> implementation, bound
+    /// automatically. State is available via the <see cref="Data"/> property.
     /// </summary>
     protected interface ISagaPropertyMapper<out TState>
     {
         /// <summary>
-        /// Registers a handler for <typeparamref name="TEvent"/> that can START
-        /// a new saga instance. If no existing saga is found for the correlation
-        /// ID, a new one is created.
+        /// Maps <typeparamref name="TEvent"/> to a correlation ID for an event that
+        /// can START a new saga instance. If no existing saga is found for the
+        /// correlation ID, a new one is created. The saga's
+        /// <c>IMessageHandler&lt;<typeparamref name="TEvent"/>&gt;.HandleAsync</c>
+        /// implementation is invoked.
         /// </summary>
-        void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation, Func<TEvent, TSagaState, CancellationToken, ValueTask> handler);
+        void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation);
 
         /// <summary>
-        /// Registers a handler for <typeparamref name="TEvent"/> that goes to
-        /// an EXISTING saga instance. If no saga is found, the event is discarded.
+        /// Maps <typeparamref name="TEvent"/> to a correlation ID for an event that
+        /// goes to an EXISTING saga instance. If no saga is found, the event is
+        /// discarded. The saga's
+        /// <c>IMessageHandler&lt;<typeparamref name="TEvent"/>&gt;.HandleAsync</c>
+        /// implementation is invoked.
         /// </summary>
-        void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation, Func<TEvent, TSagaState, CancellationToken, ValueTask> handler);
+        void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation);
     }
 
     internal void BuildHandlers()
@@ -101,23 +118,30 @@ public abstract class Saga<TSagaState> : Saga
 
         public Mapper(Saga<TSagaState> saga) => _saga = saga;
 
-        public void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation, Func<TEvent, TSagaState, CancellationToken, ValueTask> handler)
-        {
-            _saga.Handlers[typeof(TEvent)] = new SagaHandlerRegistration
-            {
-                IsStartedBy = true,
-                GetCorrelationId = e => correlation((TEvent)e),
-                Handler = (e, state, ct) => handler((TEvent)e, (TSagaState)state, ct),
-            };
-        }
+        public void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation)
+            => Register<TEvent>(correlation, isStartedBy: true);
 
-        public void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation, Func<TEvent, TSagaState, CancellationToken, ValueTask> handler)
+        public void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation)
+            => Register<TEvent>(correlation, isStartedBy: false);
+
+        // Binds the handler with a plain generic-interface type check. No reflection,
+        // GetMethod, or CreateDelegate — fully AOT/trim-safe. State is reached via the
+        // saga's Data property, so the handler takes no state parameter.
+        private void Register<TEvent>(Func<TEvent, Guid> correlation, bool isStartedBy)
         {
+            if (_saga is not IMessageHandler<TEvent> handler)
+            {
+                throw new InvalidOperationException(
+                    $"Saga '{_saga.GetType().Name}' maps '{typeof(TEvent).Name}' but does not implement " +
+                    $"IMessageHandler<{typeof(TEvent).Name}>. Add the interface and a " +
+                    $"'ValueTask HandleAsync({typeof(TEvent).Name} message, CancellationToken ct)' method.");
+            }
+
             _saga.Handlers[typeof(TEvent)] = new SagaHandlerRegistration
             {
-                IsStartedBy = false,
+                IsStartedBy = isStartedBy,
                 GetCorrelationId = e => correlation((TEvent)e),
-                Handler = (e, state, ct) => handler((TEvent)e, (TSagaState)state, ct),
+                Handler = (e, _, ct) => handler.HandleAsync((TEvent)e, ct),
             };
         }
     }

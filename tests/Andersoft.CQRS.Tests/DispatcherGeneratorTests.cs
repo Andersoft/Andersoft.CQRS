@@ -13,358 +13,299 @@ public sealed class DispatcherGeneratorTests
     private static readonly CSharpParseOptions ParseOptions = CSharpParseOptions.Default
         .WithLanguageVersion(LanguageVersion.CSharp11);
 
+    // The library's public surface, reduced to what the generator keys off: two handler
+    // arities, two interceptor arities, the pipeline delegates, and the saga base.
     private const string ContractsSource = @"
+namespace Andersoft.CQRS
+{
+    using System.Threading.Tasks;
+    public delegate ValueTask<TResult> RequestHandlerDelegate<TResult>();
+    public delegate ValueTask RequestHandlerDelegate();
+}
 namespace Andersoft.CQRS.Abstractions
 {
     using System;
     using System.Threading;
     using System.Threading.Tasks;
+    using Andersoft.CQRS;
 
-    public interface IQuery<TResult> { }
-    public interface ICommand<TResult> { }
-    public interface IQueryHandler<in TQuery, TResult> where TQuery : IQuery<TResult> { Task<TResult> HandleAsync(TQuery query, CancellationToken ct = default); }
-    public interface ICommandHandler<in TCommand, TResult> where TCommand : ICommand<TResult> { Task<TResult> HandleAsync(TCommand command, CancellationToken ct = default); }
+    public interface IMessageHandler<in TMessage> { ValueTask HandleAsync(TMessage message, CancellationToken ct = default); }
+    public interface IMessageHandler<in TMessage, TResult> { ValueTask<TResult> HandleAsync(TMessage message, CancellationToken ct = default); }
     public interface IInterceptHandler<in TMessage, TResult> { ValueTask<TResult> HandleAsync(TMessage message, RequestHandlerDelegate<TResult> next, CancellationToken ct); }
-    public delegate ValueTask<TResult> RequestHandlerDelegate<TResult>();
-    public interface IDomainEventHandler<in TEvent> { Task HandleAsync(TEvent domainEvent, CancellationToken ct = default); }
+    public interface IInterceptHandler<in TMessage> { ValueTask HandleAsync(TMessage message, RequestHandlerDelegate next, CancellationToken ct); }
+
+    public abstract class SagaState { public Guid CorrelationId { get; set; } public uint Version { get; set; } }
+    public abstract class Saga { }
+    public abstract class Saga<TState> : Saga where TState : SagaState, new()
+    {
+        protected interface ISagaPropertyMapper<out T>
+        {
+            void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation);
+            void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation);
+        }
+        protected abstract void ConfigureHowToFindSaga(ISagaPropertyMapper<TState> mapper);
+    }
 }";
 
     [Fact]
-    public void QueryAndHandler_GeneratesDispatchAndRegistration()
+    public void ResultHandler_GeneratesSingleDispatchAndRegistration()
     {
         var source = ContractsSource + @"
-
 namespace TestApp
 {
     using Andersoft.CQRS.Abstractions;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public record GetUserQuery : IQuery<string> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    public record GetUserQuery { }
+    public class GetUserHandler : IMessageHandler<GetUserQuery, string>
     {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default)
-            => Task.FromResult(""Alice"");
+        public ValueTask<string> HandleAsync(GetUserQuery message, CancellationToken ct = default) => new(""Alice"");
     }
 }";
+        var generated = RunAndGet(source);
 
-        var (genResult, _) = Run(source);
+        var dispatcher = generated.Dispatcher;
+        Assert.Contains("public System.Threading.Tasks.ValueTask<string> DispatchAsync(", dispatcher);
+        Assert.Contains("IMessageHandler<TestApp.GetUserQuery, string>", dispatcher);
+        Assert.Contains("=> _getUserQueryHandler.HandleAsync(message, ct);", dispatcher);
 
-        var generated = genResult.Results[0].GeneratedSources;
-        Assert.Equal(2, generated.Length);
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Contains("public sealed class TypedDispatcher", dispatcherSrc);
-        Assert.Contains("IQueryHandler<TestApp.GetUserQuery, string>", dispatcherSrc);
-
-        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
-        Assert.Contains("AddApplicationHandlers", regSrc);
-        Assert.Contains("TestApp.GetUserHandler", regSrc);
+        Assert.Contains("services.AddScoped<IMessageHandler<TestApp.GetUserQuery, string>, TestApp.GetUserHandler>();", generated.Registration);
     }
 
     [Fact]
-    public void CommandAndHandler_GeneratesDispatch()
+    public void VoidHandler_GeneratesFanOutDispatchAndRegistration()
     {
         var source = ContractsSource + @"
-
 namespace TestApp
 {
     using Andersoft.CQRS.Abstractions;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public record CreateOrderCommand : ICommand<int> { }
-    public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, int>
+    public record CreateOrder { }
+    public class CreateOrderHandler : IMessageHandler<CreateOrder>
     {
-        public Task<int> HandleAsync(CreateOrderCommand command, CancellationToken ct = default)
-            => Task.FromResult(42);
+        public ValueTask HandleAsync(CreateOrder message, CancellationToken ct = default) => default;
     }
 }";
+        var generated = RunAndGet(source);
 
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
+        // Void messages dispatch to ALL handlers and return no value.
+        Assert.Contains("public System.Threading.Tasks.ValueTask DispatchAsync(", generated.Dispatcher);
+        Assert.Contains("=> InvokeAll(_createOrderHandlers, message, ct);", generated.Dispatcher);
+        Assert.Contains("System.Collections.Generic.List<IMessageHandler<TestApp.CreateOrder>>", generated.Dispatcher);
 
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Contains("ICommandHandler<TestApp.CreateOrderCommand, int>", dispatcherSrc);
+        Assert.Contains("services.AddScoped<IMessageHandler<TestApp.CreateOrder>, TestApp.CreateOrderHandler>();", generated.Registration);
     }
 
     [Fact]
-    public void NoCqrsTypes_GeneratesNoOutput()
+    public void VoidMessage_WithManyHandlers_FansOutAndRegistersAll()
     {
-        var source = @"namespace TestApp { public class PlainClass { } }";
+        var source = ContractsSource + @"
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
 
+    public record OrderPlaced { }
+    public class EmailHandler : IMessageHandler<OrderPlaced>
+    {
+        public ValueTask HandleAsync(OrderPlaced message, CancellationToken ct = default) => default;
+    }
+    public class AuditHandler : IMessageHandler<OrderPlaced>
+    {
+        public ValueTask HandleAsync(OrderPlaced message, CancellationToken ct = default) => default;
+    }
+}";
+        var generated = RunAndGet(source);
+
+        // One dispatch overload, two registrations — fan-out is just handler count.
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(generated.Dispatcher, @"InvokeAll\(_orderPlacedHandlers"));
+        Assert.Contains("services.AddScoped<IMessageHandler<TestApp.OrderPlaced>, TestApp.EmailHandler>();", generated.Registration);
+        Assert.Contains("services.AddScoped<IMessageHandler<TestApp.OrderPlaced>, TestApp.AuditHandler>();", generated.Registration);
+    }
+
+    [Fact]
+    public void VoidMessages_GenerateObjectCatchAllDispatch()
+    {
+        var source = ContractsSource + @"
+namespace TestApp
+{
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public record OrderPlaced { }
+    public record OrderShipped { }
+    public class P : IMessageHandler<OrderPlaced> { public ValueTask HandleAsync(OrderPlaced m, CancellationToken ct = default) => default; }
+    public class S : IMessageHandler<OrderShipped> { public ValueTask HandleAsync(OrderShipped m, CancellationToken ct = default) => default; }
+}";
+        var generated = RunAndGet(source);
+
+        Assert.Contains("public System.Threading.Tasks.ValueTask DispatchAsync(\n        object message,", generated.Dispatcher);
+        Assert.Contains("=> message switch", generated.Dispatcher);
+        Assert.Contains("TestApp.OrderPlaced e => DispatchAsync(e, ct),", generated.Dispatcher);
+        Assert.Contains("TestApp.OrderShipped e => DispatchAsync(e, ct),", generated.Dispatcher);
+        Assert.Contains("_ => default,", generated.Dispatcher);
+    }
+
+    [Fact]
+    public void NoHandlers_GeneratesNoOutput()
+    {
+        var source = ContractsSource + @"namespace TestApp { public class PlainClass { } }";
         var (genResult, _) = Run(source);
-
         Assert.Empty(genResult.Results[0].GeneratedSources);
     }
 
     [Fact]
-    public void Interceptor_GeneratesInterceptorLogic()
+    public void ResultInterceptor_GeneratesChain()
     {
         var source = ContractsSource + @"
-
 namespace TestApp
 {
+    using Andersoft.CQRS;
     using Andersoft.CQRS.Abstractions;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public record GetUserQuery : IQuery<string> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    public record GetUserQuery { }
+    public class GetUserHandler : IMessageHandler<GetUserQuery, string>
     {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default)
-            => Task.FromResult(""Alice"");
+        public ValueTask<string> HandleAsync(GetUserQuery message, CancellationToken ct = default) => new(""Alice"");
     }
     public class LoggingInterceptor : IInterceptHandler<GetUserQuery, string>
     {
-        public ValueTask<string> HandleAsync(GetUserQuery msg, RequestHandlerDelegate<string> next, CancellationToken ct) => next();
+        public ValueTask<string> HandleAsync(GetUserQuery m, RequestHandlerDelegate<string> next, CancellationToken ct) => next();
     }
 }";
+        var generated = RunAndGet(source);
 
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Contains("Interceptors", dispatcherSrc);
-        Assert.Contains("ChainInterceptors", dispatcherSrc);
+        Assert.Contains("_getUserQueryInterceptors", generated.Dispatcher);
+        Assert.Contains("ChainInterceptors(_getUserQueryInterceptors", generated.Dispatcher);
+        Assert.Contains("services.AddScoped<IInterceptHandler<TestApp.GetUserQuery, string>, TestApp.LoggingInterceptor>();", generated.Registration);
     }
 
     [Fact]
-    public void OpenGenericInterceptor_AppliesToEveryMessage()
+    public void VoidInterceptor_GeneratesVoidChain()
     {
         var source = ContractsSource + @"
-
 namespace TestApp
 {
+    using Andersoft.CQRS;
     using Andersoft.CQRS.Abstractions;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public record GetUserQuery : IQuery<string> { }
-    public record CreateOrderCommand : ICommand<int> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    public record CreateOrder { }
+    public class CreateOrderHandler : IMessageHandler<CreateOrder>
     {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
+        public ValueTask HandleAsync(CreateOrder message, CancellationToken ct = default) => default;
     }
-    public class CreateOrderHandler : ICommandHandler<CreateOrderCommand, int>
+    public class ValidateOrder : IInterceptHandler<CreateOrder>
     {
-        public Task<int> HandleAsync(CreateOrderCommand command, CancellationToken ct = default) => Task.FromResult(1);
+        public ValueTask HandleAsync(CreateOrder m, RequestHandlerDelegate next, CancellationToken ct) => next();
+    }
+}";
+        var generated = RunAndGet(source);
+
+        Assert.Contains("ChainInterceptors(_createOrderInterceptors, message, () => InvokeAll(_createOrderHandlers", generated.Dispatcher);
+        Assert.Contains("System.Collections.Generic.List<IInterceptHandler<TestApp.CreateOrder>>", generated.Dispatcher);
+        Assert.Contains("services.AddScoped<IInterceptHandler<TestApp.CreateOrder>, TestApp.ValidateOrder>();", generated.Registration);
+    }
+
+    [Fact]
+    public void OpenGenericInterceptor_AppliesToEveryResultMessage()
+    {
+        var source = ContractsSource + @"
+namespace TestApp
+{
+    using Andersoft.CQRS;
+    using Andersoft.CQRS.Abstractions;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public record GetUserQuery { }
+    public class GetUserHandler : IMessageHandler<GetUserQuery, string>
+    {
+        public ValueTask<string> HandleAsync(GetUserQuery message, CancellationToken ct = default) => new(""Alice"");
     }
     public class LoggingInterceptor<TMessage, TResult> : IInterceptHandler<TMessage, TResult>
     {
-        public ValueTask<TResult> HandleAsync(TMessage msg, RequestHandlerDelegate<TResult> next, CancellationToken ct) => next();
+        public ValueTask<TResult> HandleAsync(TMessage m, RequestHandlerDelegate<TResult> next, CancellationToken ct) => next();
     }
 }";
+        var generated = RunAndGet(source);
 
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-
-        // Both the query and the command get an interceptor pipeline even though no closed
-        // interceptor targets either of them.
-        Assert.Contains("_getUserQueryInterceptors", dispatcherSrc);
-        Assert.Contains("_createOrderCommandInterceptors", dispatcherSrc);
-        Assert.Contains("ChainInterceptors(_getUserQueryInterceptors", dispatcherSrc);
-        Assert.Contains("ChainInterceptors(_createOrderCommandInterceptors", dispatcherSrc);
-
-        // Open generic interceptor is registered against the unbound interface.
-        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
-        Assert.Contains("services.AddScoped(typeof(IInterceptHandler<,>), typeof(TestApp.LoggingInterceptor<,>));", regSrc);
+        Assert.Contains("ChainInterceptors(_getUserQueryInterceptors", generated.Dispatcher);
+        Assert.Contains("services.AddScoped(typeof(IInterceptHandler<,>), typeof(TestApp.LoggingInterceptor<,>));", generated.Registration);
     }
 
     [Fact]
-    public void OpenGenericInterceptor_CoexistsWithClosedInterceptor()
+    public void Saga_IsExcludedFromHandlers_AndWiredAsCoordinator()
     {
         var source = ContractsSource + @"
-
 namespace TestApp
 {
     using Andersoft.CQRS.Abstractions;
+    using System;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public record GetUserQuery : IQuery<string> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
+    public record NodeStarted(Guid ExecutionId);
+    public record NodeCompleted(Guid ExecutionId);
+
+    public sealed class WorkflowState : SagaState { }
+
+    public sealed class WorkflowSaga
+        : Saga<WorkflowState>, IMessageHandler<NodeStarted>, IMessageHandler<NodeCompleted>
     {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
-    }
-    public class GetUserInterceptor : IInterceptHandler<GetUserQuery, string>
-    {
-        public ValueTask<string> HandleAsync(GetUserQuery msg, RequestHandlerDelegate<string> next, CancellationToken ct) => next();
-    }
-    public class LoggingInterceptor<TMessage, TResult> : IInterceptHandler<TMessage, TResult>
-    {
-        public ValueTask<TResult> HandleAsync(TMessage msg, RequestHandlerDelegate<TResult> next, CancellationToken ct) => next();
-    }
-}";
-
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
-
-        // Closed interceptor registered as a concrete pair, open one against the unbound interface.
-        Assert.Contains("services.AddScoped<IInterceptHandler<TestApp.GetUserQuery, string>, TestApp.GetUserInterceptor>();", regSrc);
-        Assert.Contains("services.AddScoped(typeof(IInterceptHandler<,>), typeof(TestApp.LoggingInterceptor<,>));", regSrc);
-
-        // Only a single interceptor list/parameter is emitted for the message.
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Single(System.Text.RegularExpressions.Regex.Matches(dispatcherSrc, "_getUserQueryInterceptors;"));
-    }
-
-    [Fact]
-    public void DomainEventHandler_GeneratesRegistration()
-    {
-        var source = ContractsSource + @"
-
-namespace TestApp
-{
-    using Andersoft.CQRS.Abstractions;
-    using System.Threading;
-    using System.Threading.Tasks;
-
-    public record UserCreatedEvent { }
-    public class UserCreatedHandler : IDomainEventHandler<UserCreatedEvent>
-    {
-        public Task HandleAsync(UserCreatedEvent e, CancellationToken ct = default) => Task.CompletedTask;
+        protected override void ConfigureHowToFindSaga(ISagaPropertyMapper<WorkflowState> m)
+        {
+            m.MapStartedBy<NodeStarted>(e => e.ExecutionId);
+            m.MapHandledBy<NodeCompleted>(e => e.ExecutionId);
+        }
+        public ValueTask HandleAsync(NodeStarted message, CancellationToken ct = default) => default;
+        public ValueTask HandleAsync(NodeCompleted message, CancellationToken ct = default) => default;
     }
 }";
+        var generated = RunAndGet(source);
 
+        // The saga is NOT registered as a direct handler...
+        Assert.DoesNotContain("TestApp.WorkflowSaga>();", generated.Registration);
+        Assert.DoesNotContain("IMessageHandler<TestApp.NodeStarted>, TestApp.WorkflowSaga>", generated.Registration);
+
+        // ...it's an AddSaga coordinator, and its events flow through SagaDispatcher fan-out.
+        Assert.Contains("services.AddSaga<TestApp.WorkflowSaga, TestApp.WorkflowState>();", generated.Registration);
+        Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeStarted>(", generated.Registration);
+        Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeCompleted>(", generated.Registration);
+
+        // Saga events appear as void messages in the dispatcher.
+        Assert.Contains("InvokeAll(_nodeStartedHandlers, message, ct);", generated.Dispatcher);
+
+        // EF model config for the state type is generated for OnModelCreating.
+        Assert.Contains("public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(", generated.Registration);
+        Assert.Contains("modelBuilder.ConfigureSagaState<TestApp.WorkflowState>();", generated.Registration);
+    }
+
+    // ── harness ────────────────────────────────────────────────────────
+
+    private sealed class Generated
+    {
+        public string Dispatcher { get; init; } = string.Empty;
+        public string Registration { get; init; } = string.Empty;
+    }
+
+    private static Generated RunAndGet(string source)
+    {
         var (genResult, _) = Run(source);
         var generated = genResult.Results[0].GeneratedSources;
-
-        var regSrc = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString();
-        Assert.Contains("IDomainEventHandler<TestApp.UserCreatedEvent>", regSrc);
-    }
-
-    [Fact]
-    public void DomainEvents_GenerateCatchAllPublish_TypedToCommonMarkerInterface()
-    {
-        var source = ContractsSource + @"
-
-namespace TestApp
-{
-    using Andersoft.CQRS.Abstractions;
-    using System.Threading;
-    using System.Threading.Tasks;
-
-    public interface IDomainEvent { }
-    public record UserCreatedEvent : IDomainEvent { }
-    public record UserDeletedEvent : IDomainEvent { }
-    public class UserCreatedHandler : IDomainEventHandler<UserCreatedEvent>
-    {
-        public Task HandleAsync(UserCreatedEvent e, CancellationToken ct = default) => Task.CompletedTask;
-    }
-    public class UserDeletedHandler : IDomainEventHandler<UserDeletedEvent>
-    {
-        public Task HandleAsync(UserDeletedEvent e, CancellationToken ct = default) => Task.CompletedTask;
-    }
-}";
-
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-
-        // Per-type overloads still present
-        Assert.Contains("PublishAsync(\n        TestApp.UserCreatedEvent domainEvent", dispatcherSrc);
-
-        // Catch-all typed to the shared marker interface, switching on the concrete type
-        Assert.Contains("PublishAsync(\n        TestApp.IDomainEvent domainEvent", dispatcherSrc);
-        Assert.Contains("=> domainEvent switch", dispatcherSrc);
-        Assert.Contains("TestApp.UserCreatedEvent e => PublishAsync(e, ct),", dispatcherSrc);
-        Assert.Contains("TestApp.UserDeletedEvent e => PublishAsync(e, ct),", dispatcherSrc);
-        Assert.Contains("_ => default,", dispatcherSrc);
-    }
-
-    [Fact]
-    public void DomainEvents_WithNoCommonInterface_CatchAllFallsBackToObject()
-    {
-        var source = ContractsSource + @"
-
-namespace TestApp
-{
-    using Andersoft.CQRS.Abstractions;
-    using System.Threading;
-    using System.Threading.Tasks;
-
-    public record UserCreatedEvent { }
-    public class UserCreatedHandler : IDomainEventHandler<UserCreatedEvent>
-    {
-        public Task HandleAsync(UserCreatedEvent e, CancellationToken ct = default) => Task.CompletedTask;
-    }
-}";
-
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-
-        Assert.Contains("PublishAsync(\n        object domainEvent", dispatcherSrc);
-        Assert.Contains("TestApp.UserCreatedEvent e => PublishAsync(e, ct),", dispatcherSrc);
-    }
-
-    [Fact]
-    public void MultipleQueries_GeneratesAllDispatchMethods()
-    {
-        var source = ContractsSource + @"
-
-namespace TestApp
-{
-    using Andersoft.CQRS.Abstractions;
-    using System.Threading;
-    using System.Threading.Tasks;
-
-    public record GetUserQuery : IQuery<string> { }
-    public record ListOrdersQuery : IQuery<int> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
-    {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
-    }
-    public class ListOrdersHandler : IQueryHandler<ListOrdersQuery, int>
-    {
-        public Task<int> HandleAsync(ListOrdersQuery query, CancellationToken ct = default) => Task.FromResult(10);
-    }
-}";
-
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Contains("GetUserQuery", dispatcherSrc);
-        Assert.Contains("ListOrdersQuery", dispatcherSrc);
-    }
-
-    [Fact]
-    public void MixedQueryAndCommand_GeneratesBothDispatchMethods()
-    {
-        var source = ContractsSource + @"
-
-namespace TestApp
-{
-    using Andersoft.CQRS.Abstractions;
-    using System.Threading;
-    using System.Threading.Tasks;
-
-    public record GetUserQuery : IQuery<string> { }
-    public record CreateUserCommand : ICommand<int> { }
-    public class GetUserHandler : IQueryHandler<GetUserQuery, string>
-    {
-        public Task<string> HandleAsync(GetUserQuery query, CancellationToken ct = default) => Task.FromResult(""Alice"");
-    }
-    public class CreateUserHandler : ICommandHandler<CreateUserCommand, int>
-    {
-        public Task<int> HandleAsync(CreateUserCommand command, CancellationToken ct = default) => Task.FromResult(1);
-    }
-}";
-
-        var (genResult, _) = Run(source);
-        var generated = genResult.Results[0].GeneratedSources;
-
-        var dispatcherSrc = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString();
-        Assert.Contains("IQueryHandler<TestApp.GetUserQuery, string>", dispatcherSrc);
-        Assert.Contains("ICommandHandler<TestApp.CreateUserCommand, int>", dispatcherSrc);
+        return new Generated
+        {
+            Dispatcher = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString(),
+            Registration = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString(),
+        };
     }
 
     private static (GeneratorDriverRunResult, Compilation) Run(string source)
@@ -390,8 +331,6 @@ namespace TestApp
         var generator = new DispatcherGenerator();
         GeneratorDriver driver = CSharpGeneratorDriver.Create(generator);
         driver = driver.RunGenerators(compilation);
-        var runResult = driver.GetRunResult();
-
-        return (runResult, compilation);
+        return (driver.GetRunResult(), compilation);
     }
 }

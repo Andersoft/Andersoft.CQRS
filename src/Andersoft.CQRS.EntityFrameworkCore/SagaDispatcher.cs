@@ -6,11 +6,13 @@ using Andersoft.CQRS.Abstractions;
 namespace Andersoft.CQRS.EntityFrameworkCore;
 
 /// <summary>
-/// Generic event handler that dispatches <typeparamref name="TEvent"/> to
-/// all registered <see cref="Saga"/> instances. Auto-loads state, calls the
-/// saga handler, and auto-saves.
+/// The coordinator handler for a saga event. Registered as an
+/// <see cref="Andersoft.CQRS.Abstractions.IMessageHandler{TEvent}"/> on the event's
+/// fan-out, it dispatches <typeparamref name="TEvent"/> to all registered
+/// <see cref="Saga"/> instances — auto-loading state, calling the saga handler, and
+/// auto-saving. The saga itself is never registered as a direct handler.
 /// </summary>
-internal sealed class SagaDispatcher<TEvent>
+public sealed class SagaDispatcher<TEvent> : Andersoft.CQRS.Abstractions.IMessageHandler<TEvent>
 {
     private readonly IEnumerable<Andersoft.CQRS.Abstractions.Saga> _sagas;
 
@@ -19,7 +21,7 @@ internal sealed class SagaDispatcher<TEvent>
         _sagas = sagas;
     }
 
-    public async ValueTask HandleAsync(TEvent domainEvent, CancellationToken ct)
+    public async ValueTask HandleAsync(TEvent domainEvent, CancellationToken ct = default)
     {
         foreach (var saga in _sagas)
         {

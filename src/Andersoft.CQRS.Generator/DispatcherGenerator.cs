@@ -8,174 +8,110 @@ using Microsoft.CodeAnalysis.Text;
 
 namespace Andersoft.CQRS;
 
+/// <summary>
+/// Generates a strongly-typed dispatcher and DI registration from the message handlers
+/// in the compilation. There are no message marker interfaces: everything is inferred
+/// from the handler declarations.
+///
+/// <list type="bullet">
+/// <item><c>IMessageHandler&lt;TMessage, TResult&gt;</c> ⇒ a single-dispatch message that
+/// returns a value (<c>DispatchAsync</c> returns <c>ValueTask&lt;TResult&gt;</c>).</item>
+/// <item><c>IMessageHandler&lt;TMessage&gt;</c> ⇒ a void message dispatched to <em>all</em>
+/// registered handlers (one or many — "command" vs "event" is not modelled).</item>
+/// <item><c>Saga&lt;TState&gt;</c> subclasses are coordinators, excluded from handler
+/// discovery; each saga event gets a <c>SagaDispatcher&lt;TEvent&gt;</c> registered onto
+/// that event's fan-out.</item>
+/// </list>
+/// </summary>
 [Generator]
 public sealed class DispatcherGenerator : IIncrementalGenerator
 {
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        var messageTypes = context.SyntaxProvider
-            .CreateSyntaxProvider(
-                predicate: static (node, _) => node is RecordDeclarationSyntax,
-                transform: static (ctx, ct) => GetMessageTypeInfo(ctx, ct))
-            .Where(static m => m is not null)
-            .Collect();
-
-        var handlerTypes = context.SyntaxProvider
+        var handlers = context.SyntaxProvider
             .CreateSyntaxProvider(
                 predicate: static (node, _) => node is ClassDeclarationSyntax,
                 transform: static (ctx, ct) => GetHandlerTypes(ctx, ct))
             .Where(static h => h.Length > 0)
-            .SelectMany<ImmutableArray<HandlerTypeInfo>, HandlerTypeInfo>(static (h, _) => h)
+            .SelectMany<ImmutableArray<HandlerInfo>, HandlerInfo>(static (h, _) => h)
             .Collect();
 
-        // Saga discovery — classes extending Saga<TState>
-        var sagaTypes = context.SyntaxProvider
+        var sagas = context.SyntaxProvider
             .CreateSyntaxProvider(
                 predicate: static (node, _) => node is ClassDeclarationSyntax,
-                transform: static (ctx, ct) => GetSagaTypes(ctx, ct))
+                transform: static (ctx, ct) => GetSagaType(ctx, ct))
             .Where(static s => s is not null)
             .Select(static (s, _) => s!)
             .Collect();
 
-        var combined = messageTypes.Combine(handlerTypes).Combine(sagaTypes);
+        var combined = handlers.Combine(sagas);
 
         context.RegisterSourceOutput(combined, static (spc, pair) =>
         {
-            var messages = pair.Left.Left;
-            var handlers = pair.Left.Right;
-            var sagas = pair.Right;
+            var allHandlers = pair.Left;
+            var allSagas = pair.Right;
 
-            if (!messages.IsEmpty || handlers.Any(h => h.Kind == HandlerKind.DomainEvent))
-            {
-                var queries = messages.Where(m => m!.Kind == MessageKind.Query).ToList();
-                var commands = messages.Where(m => m!.Kind == MessageKind.Command).ToList();
-                var interceptors = handlers.Where(h => h.Kind == HandlerKind.Interceptor).ToList();
-                var domainEvents = handlers.Where(h => h.Kind == HandlerKind.DomainEvent).ToList();
-                var source = GenerateTypedDispatcher(queries!, commands!, interceptors, domainEvents);
-                spc.AddSource("TypedDispatcher.g.cs", SourceText.From(source, Encoding.UTF8));
-            }
+            if (allHandlers.IsEmpty && allSagas.IsEmpty)
+                return;
 
-            if (!handlers.IsEmpty || !sagas.IsEmpty)
-            {
-                var source = GenerateRegistrationExtension(handlers, sagas);
-                spc.AddSource("HandlerRegistration.g.cs", SourceText.From(source, Encoding.UTF8));
-            }
+            spc.AddSource("TypedDispatcher.g.cs",
+                SourceText.From(GenerateDispatcher(allHandlers, allSagas), Encoding.UTF8));
+            spc.AddSource("HandlerRegistration.g.cs",
+                SourceText.From(GenerateRegistration(allHandlers, allSagas), Encoding.UTF8));
         });
     }
 
-    private static MessageTypeInfo? GetMessageTypeInfo(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
-    {
-        var recordDecl = (RecordDeclarationSyntax)context.Node;
-        var model = context.SemanticModel;
+    // ── Discovery ──────────────────────────────────────────────────────
 
-        if (model.GetDeclaredSymbol(recordDecl, ct) is not INamedTypeSymbol recordSymbol)
-            return null;
-
-        foreach (var iface in recordSymbol.AllInterfaces)
-        {
-            if (iface.IsGenericType && iface.TypeArguments.Length == 1)
-            {
-                var ifaceName = iface.ConstructedFrom.ToDisplayString();
-                if (ifaceName == "Andersoft.CQRS.Abstractions.IQuery<TResult>")
-                {
-                    return new MessageTypeInfo(
-                        recordSymbol.ToDisplayString(),
-                        recordSymbol.Name,
-                        iface.TypeArguments[0].ToDisplayString(),
-                        MessageKind.Query);
-                }
-                if (ifaceName == "Andersoft.CQRS.Abstractions.ICommand<TResult>")
-                {
-                    return new MessageTypeInfo(
-                        recordSymbol.ToDisplayString(),
-                        recordSymbol.Name,
-                        iface.TypeArguments[0].ToDisplayString(),
-                        MessageKind.Command);
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private static ImmutableArray<HandlerTypeInfo> GetHandlerTypes(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
+    private static ImmutableArray<HandlerInfo> GetHandlerTypes(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
     {
         var classDecl = (ClassDeclarationSyntax)context.Node;
-        var model = context.SemanticModel;
+        if (context.SemanticModel.GetDeclaredSymbol(classDecl, ct) is not INamedTypeSymbol symbol)
+            return ImmutableArray<HandlerInfo>.Empty;
 
-        if (model.GetDeclaredSymbol(classDecl, ct) is not INamedTypeSymbol classSymbol)
-            return ImmutableArray<HandlerTypeInfo>.Empty;
+        // Sagas are coordinators, not dispatch targets — discovered separately and
+        // excluded here so they are never registered as direct message handlers.
+        if (ExtendsSaga(symbol))
+            return ImmutableArray<HandlerInfo>.Empty;
 
-        var results = ImmutableArray.CreateBuilder<HandlerTypeInfo>();
+        var results = ImmutableArray.CreateBuilder<HandlerInfo>();
 
-        foreach (var iface in classSymbol.AllInterfaces)
+        foreach (var iface in symbol.AllInterfaces)
         {
             if (!iface.IsGenericType)
                 continue;
 
-            var typeArgs = iface.TypeArguments;
-            var ifaceName = iface.ConstructedFrom.ToDisplayString();
+            var name = iface.ConstructedFrom.ToDisplayString();
+            var args = iface.TypeArguments;
 
-            if (typeArgs.Length == 2)
+            switch (name)
             {
-                if (ifaceName == "Andersoft.CQRS.Abstractions.IQueryHandler<TQuery, TResult>")
-                {
-                    results.Add(new HandlerTypeInfo(
-                        classSymbol.ToDisplayString(),
-                        typeArgs[0].ToDisplayString(),
-                        typeArgs[1].ToDisplayString(),
-                        HandlerKind.Query));
-                }
-                else if (ifaceName == "Andersoft.CQRS.Abstractions.ICommandHandler<TCommand, TResult>")
-                {
-                    results.Add(new HandlerTypeInfo(
-                        classSymbol.ToDisplayString(),
-                        typeArgs[0].ToDisplayString(),
-                        typeArgs[1].ToDisplayString(),
-                        HandlerKind.Command));
-                }
-                else if (ifaceName == "Andersoft.CQRS.Abstractions.IInterceptHandler<TMessage, TResult>")
-                {
-                    // An open generic interceptor (e.g. LoggingInterceptor<TMessage, TResult>) supplies
-                    // its type arguments from the class's own type parameters, so it applies to every
-                    // message. A closed interceptor pins concrete message/result types.
-                    var isOpenGeneric = typeArgs[0].TypeKind == TypeKind.TypeParameter
-                        || typeArgs[1].TypeKind == TypeKind.TypeParameter;
+                case "Andersoft.CQRS.Abstractions.IMessageHandler<TMessage>":
+                    results.Add(HandlerInfo.Handler(symbol.ToDisplayString(), args[0].ToDisplayString(), result: null));
+                    break;
 
-                    if (isOpenGeneric)
-                    {
-                        results.Add(new HandlerTypeInfo(
-                            classSymbol.ConstructUnboundGenericType().ToDisplayString(),
-                            string.Empty,
-                            string.Empty,
-                            HandlerKind.Interceptor,
-                            isOpenGeneric: true));
-                    }
-                    else
-                    {
-                        results.Add(new HandlerTypeInfo(
-                            classSymbol.ToDisplayString(),
-                            typeArgs[0].ToDisplayString(),
-                            typeArgs[1].ToDisplayString(),
-                            HandlerKind.Interceptor));
-                    }
-                }
-            }
-            else if (typeArgs.Length == 1)
-            {
-                if (ifaceName == "Andersoft.CQRS.Abstractions.IDomainEventHandler<TEvent>")
+                case "Andersoft.CQRS.Abstractions.IMessageHandler<TMessage, TResult>":
+                    results.Add(HandlerInfo.Handler(symbol.ToDisplayString(), args[0].ToDisplayString(), args[1].ToDisplayString()));
+                    break;
+
+                case "Andersoft.CQRS.Abstractions.IInterceptHandler<TMessage>":
                 {
-                    // Exclude framework interfaces (e.g. the IEquatable<TSelf> records synthesize)
-                    // so only user-defined domain markers remain to derive the catch-all type from.
-                    var eventInterfaces = string.Join("|", typeArgs[0].AllInterfaces
-                        .Select(i => i.ToDisplayString())
-                        .Where(name => !name.StartsWith("System.")));
-                    results.Add(new HandlerTypeInfo(
-                        classSymbol.ToDisplayString(),
-                        typeArgs[0].ToDisplayString(),
-                        "System.Threading.Tasks.Task",
-                        HandlerKind.DomainEvent,
-                        eventInterfaces));
+                    var open = args[0].TypeKind == TypeKind.TypeParameter;
+                    results.Add(HandlerInfo.Interceptor(
+                        open ? symbol.ConstructUnboundGenericType().ToDisplayString() : symbol.ToDisplayString(),
+                        open ? string.Empty : args[0].ToDisplayString(),
+                        result: null, isVoid: true, isOpen: open));
+                    break;
+                }
+
+                case "Andersoft.CQRS.Abstractions.IInterceptHandler<TMessage, TResult>":
+                {
+                    var open = args[0].TypeKind == TypeKind.TypeParameter || args[1].TypeKind == TypeKind.TypeParameter;
+                    results.Add(HandlerInfo.Interceptor(
+                        open ? symbol.ConstructUnboundGenericType().ToDisplayString() : symbol.ToDisplayString(),
+                        open ? string.Empty : args[0].ToDisplayString(),
+                        result: open ? null : args[1].ToDisplayString(), isVoid: false, isOpen: open));
+                    break;
                 }
             }
         }
@@ -183,56 +119,56 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         return results.ToImmutable();
     }
 
-    private static SagaInfo? GetSagaTypes(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
+    private static bool ExtendsSaga(INamedTypeSymbol symbol)
+    {
+        for (var b = symbol.BaseType; b is not null; b = b.BaseType)
+            if (b.IsGenericType && b.ConstructedFrom.ToDisplayString() == "Andersoft.CQRS.Abstractions.Saga<TState>")
+                return true;
+        return false;
+    }
+
+    private static SagaInfo? GetSagaType(GeneratorSyntaxContext context, System.Threading.CancellationToken ct)
     {
         var classDecl = (ClassDeclarationSyntax)context.Node;
-        var model = context.SemanticModel;
-
-        if (model.GetDeclaredSymbol(classDecl, ct) is not INamedTypeSymbol classSymbol)
+        if (context.SemanticModel.GetDeclaredSymbol(classDecl, ct) is not INamedTypeSymbol symbol)
             return null;
 
-        // Walk the base type chain looking for Saga<TState>
-        var baseType = classSymbol.BaseType;
         INamedTypeSymbol? sagaBase = null;
-        while (baseType is not null)
+        for (var b = symbol.BaseType; b is not null; b = b.BaseType)
         {
-            if (baseType.IsGenericType && baseType.ConstructedFrom.ToDisplayString() == "Andersoft.CQRS.Abstractions.Saga<TState>")
+            if (b.IsGenericType && b.ConstructedFrom.ToDisplayString() == "Andersoft.CQRS.Abstractions.Saga<TState>")
             {
-                sagaBase = baseType;
+                sagaBase = b;
                 break;
             }
-            baseType = baseType.BaseType;
         }
 
         if (sagaBase is null) return null;
 
-        var stateType = sagaBase.TypeArguments[0].ToDisplayString();
-        var info = new SagaInfo(classSymbol.ToDisplayString(), stateType);
+        var info = new SagaInfo(symbol.ToDisplayString(), sagaBase.TypeArguments[0].ToDisplayString());
 
-        // Extract event types from ConfigureHowToFindSaga override
-        foreach (var member in classSymbol.GetMembers())
+        // Event types come from the MapStartedBy/MapHandledBy calls in ConfigureHowToFindSaga.
+        foreach (var member in symbol.GetMembers())
         {
             if (member is not IMethodSymbol method) continue;
-            if (method.Name != "ConfigureHowToFindSaga") continue;
-            if (method.MethodKind != MethodKind.Ordinary) continue;
+            if (method.Name != "ConfigureHowToFindSaga" || method.MethodKind != MethodKind.Ordinary) continue;
 
             foreach (var syntaxRef in method.DeclaringSyntaxReferences)
             {
-                var methodSyntax = syntaxRef.GetSyntax(ct) as MethodDeclarationSyntax;
-                if (methodSyntax?.Body is null) continue;
+                if (syntaxRef.GetSyntax(ct) is not MethodDeclarationSyntax ms || ms.Body is null) continue;
 
-                foreach (var statement in methodSyntax.Body.DescendantNodes())
+                foreach (var node in ms.Body.DescendantNodes())
                 {
-                    if (statement is not InvocationExpressionSyntax invocation) continue;
+                    if (node is not InvocationExpressionSyntax inv) continue;
+                    var expr = inv.Expression.ToString();
+                    if (!expr.Contains("MapStartedBy") && !expr.Contains("MapHandledBy")) continue;
 
-                    var expr = invocation.Expression.ToString();
-                    if (expr.Contains("MapStartedBy"))
+                    // Resolve the generic argument semantically so the event type is
+                    // fully qualified — the generated registration has no per-feature usings.
+                    if (context.SemanticModel.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m
+                        && m.TypeArguments.Length == 1)
                     {
-                        ExtractEventType(invocation, info.StartedByEventTypes);
-                    }
-                    else if (expr.Contains("MapHandledBy"))
-                    {
-                        ExtractEventType(invocation, info.HandledByEventTypes);
+                        info.EventTypes.Add(m.TypeArguments[0].ToDisplayString());
                     }
                 }
             }
@@ -241,43 +177,35 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         return info;
     }
 
-    private static void ExtractEventType(InvocationExpressionSyntax invocation, List<string> eventTypes)
-    {
-        // MapStartedBy<TEvent>(...) — extract TEvent from generic args
-        if (invocation.Expression is GenericNameSyntax generic)
-        {
-            var typeArg = generic.TypeArgumentList.Arguments.FirstOrDefault()?.ToString();
-            if (typeArg is not null)
-                eventTypes.Add(typeArg);
-        }
-        // Also try member access like m.MapStartedBy<TEvent>(...)
-        else if (invocation.Expression is MemberAccessExpressionSyntax ma
-                 && ma.Name is GenericNameSyntax maGeneric)
-        {
-            var typeArg = maGeneric.TypeArgumentList.Arguments.FirstOrDefault()?.ToString();
-            if (typeArg is not null)
-                eventTypes.Add(typeArg);
-        }
-    }
+    // ── Dispatcher generation ──────────────────────────────────────────
 
-    private static string GenerateTypedDispatcher(
-        List<MessageTypeInfo> queries,
-        List<MessageTypeInfo> commands,
-        List<HandlerTypeInfo> interceptors,
-        List<HandlerTypeInfo> domainEvents)
+    private static string GenerateDispatcher(ImmutableArray<HandlerInfo> all, ImmutableArray<SagaInfo> sagas)
     {
-        // Build a lookup: messageType -> resultType for closed interceptors.
-        var interceptorsByMessage = new Dictionary<string, string>();
-        foreach (var i in interceptors.Where(i => !i.IsOpenGeneric))
-        {
-            interceptorsByMessage[i.MessageType] = i.ResultType;
-        }
+        var handlers = all.Where(h => !h.IsInterceptor).ToList();
+        var interceptors = all.Where(h => h.IsInterceptor).ToList();
 
-        // An open generic interceptor (IInterceptHandler<,>) applies to every message, so when one is
-        // present every query/command gets the interceptor pipeline wired up. The DI container resolves
-        // the closed interceptor instances (open generic + any closed registrations) at runtime.
-        var hasOpenInterceptors = interceptors.Any(i => i.IsOpenGeneric);
-        bool HasInterceptors(MessageTypeInfo m) => hasOpenInterceptors || interceptorsByMessage.ContainsKey(m.FullTypeName);
+        // Messages that return a value — single dispatch.
+        var resultMessages = handlers.Where(h => h.ResultType is not null)
+            .GroupBy(h => h.MessageType)
+            .Select(g => new ResultMessage(g.Key, g.First().ResultType!))
+            .ToList();
+
+        // Void messages — dispatched to all handlers. Saga events are void messages whose
+        // only handler is the registered SagaDispatcher.
+        var voidMessages = handlers.Where(h => h.ResultType is null).Select(h => h.MessageType)
+            .Concat(sagas.SelectMany(s => s.EventTypes))
+            .Distinct()
+            .ToList();
+
+        var hasOpenResultInterceptor = interceptors.Any(i => i.IsOpenGeneric && !i.IsVoidInterceptor);
+        var hasOpenVoidInterceptor = interceptors.Any(i => i.IsOpenGeneric && i.IsVoidInterceptor);
+        var closedResultInterceptors = interceptors.Where(i => !i.IsOpenGeneric && !i.IsVoidInterceptor)
+            .Select(i => i.MessageType).ToImmutableHashSet();
+        var closedVoidInterceptors = interceptors.Where(i => !i.IsOpenGeneric && i.IsVoidInterceptor)
+            .Select(i => i.MessageType).ToImmutableHashSet();
+
+        bool ResultIntercepted(string msg) => hasOpenResultInterceptor || closedResultInterceptors.Contains(msg);
+        bool VoidIntercepted(string msg) => hasOpenVoidInterceptor || closedVoidInterceptors.Contains(msg);
 
         var sb = new StringBuilder();
         sb.AppendLine("// <auto-generated />");
@@ -288,231 +216,180 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine();
         sb.AppendLine("namespace Andersoft.CQRS;");
         sb.AppendLine();
-        sb.AppendLine("");
         sb.AppendLine("public sealed class TypedDispatcher");
         sb.AppendLine("{");
 
-        // Handler fields
-        foreach (var query in queries)
+        // Fields
+        foreach (var m in resultMessages)
         {
-            sb.AppendLine($"    private readonly IQueryHandler<{query.FullTypeName}, {query.ResultType}> _{ToCamelCase(query.ShortName)}Handler;");
+            var camel = ToCamelCase(ExtractShortName(m.Message));
+            sb.AppendLine($"    private readonly IMessageHandler<{m.Message}, {m.Result}> _{camel}Handler;");
+            if (ResultIntercepted(m.Message))
+                sb.AppendLine($"    private readonly System.Collections.Generic.List<IInterceptHandler<{m.Message}, {m.Result}>> _{camel}Interceptors;");
         }
-
-        foreach (var command in commands)
+        foreach (var m in voidMessages)
         {
-            sb.AppendLine($"    private readonly ICommandHandler<{command.FullTypeName}, {command.ResultType}> _{ToCamelCase(command.ShortName)}Handler;");
-        }
-
-        // Interceptor fields
-        foreach (var msg in queries.Concat(commands))
-        {
-            if (HasInterceptors(msg))
-            {
-                sb.AppendLine($"    private readonly System.Collections.Generic.List<IInterceptHandler<{msg.FullTypeName}, {msg.ResultType}>> _{ToCamelCase(msg.ShortName)}Interceptors;");
-            }
-        }
-
-        // Domain event handler fields
-        var domainEventGroups = domainEvents.GroupBy(d => d.MessageType).ToList();
-        foreach (var group in domainEventGroups)
-        {
-            var shortName = ExtractShortName(group.Key);
-            sb.AppendLine($"    private readonly System.Collections.Generic.List<IDomainEventHandler<{group.Key}>> _{ToCamelCase(shortName)}Handlers;");
+            var camel = ToCamelCase(ExtractShortName(m));
+            sb.AppendLine($"    private readonly System.Collections.Generic.List<IMessageHandler<{m}>> _{camel}Handlers;");
+            if (VoidIntercepted(m))
+                sb.AppendLine($"    private readonly System.Collections.Generic.List<IInterceptHandler<{m}>> _{camel}Interceptors;");
         }
 
         // Constructor
         sb.AppendLine();
         sb.AppendLine("    public TypedDispatcher(");
-
-        var paramList = new List<string>();
-        foreach (var query in queries)
+        var ps = new List<string>();
+        foreach (var m in resultMessages)
         {
-            paramList.Add($"        IQueryHandler<{query.FullTypeName}, {query.ResultType}> {ToCamelCase(query.ShortName)}Handler");
+            var camel = ToCamelCase(ExtractShortName(m.Message));
+            ps.Add($"        IMessageHandler<{m.Message}, {m.Result}> {camel}Handler");
+            if (ResultIntercepted(m.Message))
+                ps.Add($"        System.Collections.Generic.IEnumerable<IInterceptHandler<{m.Message}, {m.Result}>> {camel}Interceptors");
         }
-        foreach (var command in commands)
+        foreach (var m in voidMessages)
         {
-            paramList.Add($"        ICommandHandler<{command.FullTypeName}, {command.ResultType}> {ToCamelCase(command.ShortName)}Handler");
+            var camel = ToCamelCase(ExtractShortName(m));
+            ps.Add($"        System.Collections.Generic.IEnumerable<IMessageHandler<{m}>> {camel}Handlers");
+            if (VoidIntercepted(m))
+                ps.Add($"        System.Collections.Generic.IEnumerable<IInterceptHandler<{m}>> {camel}Interceptors");
         }
-        foreach (var msg in queries.Concat(commands))
-        {
-            if (HasInterceptors(msg))
-            {
-                paramList.Add($"        System.Collections.Generic.IEnumerable<IInterceptHandler<{msg.FullTypeName}, {msg.ResultType}>> {ToCamelCase(msg.ShortName)}Interceptors");
-            }
-        }
-
-        foreach (var group in domainEventGroups)
-        {
-            var shortName = ExtractShortName(group.Key);
-            paramList.Add($"        System.Collections.Generic.IEnumerable<IDomainEventHandler<{group.Key}>> {ToCamelCase(shortName)}Handlers");
-        }
-
-        sb.AppendLine(string.Join(",\n", paramList) + ")");
+        sb.AppendLine(string.Join(",\n", ps) + ")");
         sb.AppendLine("    {");
-
-        foreach (var query in queries)
+        foreach (var m in resultMessages)
         {
-            sb.AppendLine($"        _{ToCamelCase(query.ShortName)}Handler = {ToCamelCase(query.ShortName)}Handler;");
+            var camel = ToCamelCase(ExtractShortName(m.Message));
+            sb.AppendLine($"        _{camel}Handler = {camel}Handler;");
+            if (ResultIntercepted(m.Message))
+                sb.AppendLine($"        _{camel}Interceptors = System.Linq.Enumerable.ToList({camel}Interceptors ?? System.Array.Empty<IInterceptHandler<{m.Message}, {m.Result}>>());");
         }
-
-        foreach (var command in commands)
+        foreach (var m in voidMessages)
         {
-            sb.AppendLine($"        _{ToCamelCase(command.ShortName)}Handler = {ToCamelCase(command.ShortName)}Handler;");
+            var camel = ToCamelCase(ExtractShortName(m));
+            sb.AppendLine($"        _{camel}Handlers = System.Linq.Enumerable.ToList({camel}Handlers ?? System.Array.Empty<IMessageHandler<{m}>>());");
+            if (VoidIntercepted(m))
+                sb.AppendLine($"        _{camel}Interceptors = System.Linq.Enumerable.ToList({camel}Interceptors ?? System.Array.Empty<IInterceptHandler<{m}>>());");
         }
-
-        foreach (var msg in queries.Concat(commands))
-        {
-            if (HasInterceptors(msg))
-            {
-                var camel = ToCamelCase(msg.ShortName);
-                sb.AppendLine($"        _{camel}Interceptors = System.Linq.Enumerable.ToList({camel}Interceptors ?? System.Array.Empty<IInterceptHandler<{msg.FullTypeName}, {msg.ResultType}>>());");
-            }
-        }
-
-        foreach (var group in domainEventGroups)
-        {
-            var shortName = ExtractShortName(group.Key);
-            var camel = ToCamelCase(shortName);
-            sb.AppendLine($"        _{camel}Handlers = System.Linq.Enumerable.ToList({camel}Handlers ?? System.Array.Empty<IDomainEventHandler<{group.Key}>>());");
-        }
-
         sb.AppendLine("    }");
 
-        // DispatchAsync methods
-        foreach (var query in queries)
+        // Result dispatch — single handler, optional interceptor chain
+        foreach (var m in resultMessages)
         {
-            var camel = ToCamelCase(query.ShortName);
-            var hasInterceptors = HasInterceptors(query);
-
+            var camel = ToCamelCase(ExtractShortName(m.Message));
             sb.AppendLine();
-            sb.AppendLine($"    public System.Threading.Tasks.ValueTask<{query.ResultType}> DispatchAsync(");
-            sb.AppendLine($"        {query.FullTypeName} query,");
+            sb.AppendLine($"    public System.Threading.Tasks.ValueTask<{m.Result}> DispatchAsync(");
+            sb.AppendLine($"        {m.Message} message,");
             sb.AppendLine("        System.Threading.CancellationToken ct = default)");
-
-            if (hasInterceptors)
+            if (ResultIntercepted(m.Message))
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, query, () => _{camel}Handler.HandleAsync(query, ct), ct);");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, message, () => _{camel}Handler.HandleAsync(message, ct), ct);");
                 sb.AppendLine("    }");
             }
             else
             {
-                sb.AppendLine($"        => _{camel}Handler.HandleAsync(query, ct);");
+                sb.AppendLine($"        => _{camel}Handler.HandleAsync(message, ct);");
             }
         }
 
-        foreach (var command in commands)
+        // Void dispatch — fan-out to all handlers, optional interceptor chain
+        foreach (var m in voidMessages)
         {
-            var camel = ToCamelCase(command.ShortName);
-            var hasInterceptors = HasInterceptors(command);
-
+            var camel = ToCamelCase(ExtractShortName(m));
             sb.AppendLine();
-            sb.AppendLine($"    public System.Threading.Tasks.ValueTask<{command.ResultType}> DispatchAsync(");
-            sb.AppendLine($"        {command.FullTypeName} command,");
+            sb.AppendLine("    public System.Threading.Tasks.ValueTask DispatchAsync(");
+            sb.AppendLine($"        {m} message,");
             sb.AppendLine("        System.Threading.CancellationToken ct = default)");
-
-            if (hasInterceptors)
+            if (VoidIntercepted(m))
             {
                 sb.AppendLine("    {");
-                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, command, () => _{camel}Handler.HandleAsync(command, ct), ct);");
+                sb.AppendLine($"        return ChainInterceptors(_{camel}Interceptors, message, () => InvokeAll(_{camel}Handlers, message, ct), ct);");
                 sb.AppendLine("    }");
             }
             else
             {
-                sb.AppendLine($"        => _{camel}Handler.HandleAsync(command, ct);");
+                sb.AppendLine($"        => InvokeAll(_{camel}Handlers, message, ct);");
             }
         }
 
-        // PublishAsync methods
-        foreach (var group in domainEventGroups)
+        // Catch-all for void messages known only as a base type / object.
+        if (voidMessages.Count > 0)
         {
-            var shortName = ExtractShortName(group.Key);
-            var camel = ToCamelCase(shortName);
-
             sb.AppendLine();
-            sb.AppendLine("    public System.Threading.Tasks.ValueTask PublishAsync(");
-            sb.AppendLine($"        {group.Key} domainEvent,");
+            sb.AppendLine("    public System.Threading.Tasks.ValueTask DispatchAsync(");
+            sb.AppendLine("        object message,");
             sb.AppendLine("        System.Threading.CancellationToken ct = default)");
-            sb.AppendLine("    {");
-            sb.AppendLine($"        return PublishToHandlers(_{camel}Handlers, domainEvent, ct);");
-            sb.AppendLine("    }");
-        }
-
-        // Catch-all PublishAsync: dispatches to the matching concrete overload at runtime.
-        // Needed because callers (e.g. the SaveChanges interceptor) only know events as the
-        // base IDomainEvent interface, while the per-type overloads above are concrete.
-        if (domainEventGroups.Count > 0)
-        {
-            // The catch-all parameter is the single interface common to every event type
-            // (typically the IDomainEvent marker). Falls back to object if there isn't one.
-            var interfaceSets = domainEventGroups
-                .Select(g => g.First().EventInterfaces
-                    .Split(new[] { '|' }, System.StringSplitOptions.RemoveEmptyEntries)
-                    .ToList())
-                .ToList();
-
-            var common = interfaceSets[0];
-            for (var i = 1; i < interfaceSets.Count; i++)
-            {
-                common = common.Where(x => interfaceSets[i].Contains(x)).ToList();
-            }
-
-            var catchAllType = common.Count == 1 ? common[0] : "object";
-
-            sb.AppendLine();
-            sb.AppendLine("    public System.Threading.Tasks.ValueTask PublishAsync(");
-            sb.AppendLine($"        {catchAllType} domainEvent,");
-            sb.AppendLine("        System.Threading.CancellationToken ct = default)");
-            sb.AppendLine("        => domainEvent switch");
+            sb.AppendLine("        => message switch");
             sb.AppendLine("        {");
-            foreach (var group in domainEventGroups)
-            {
-                sb.AppendLine($"            {group.Key} e => PublishAsync(e, ct),");
-            }
+            foreach (var m in voidMessages)
+                sb.AppendLine($"            {m} e => DispatchAsync(e, ct),");
             sb.AppendLine("            _ => default,");
             sb.AppendLine("        };");
         }
 
-        // ChainInterceptors helper method
-        sb.AppendLine();
-        sb.AppendLine("    private static System.Threading.Tasks.ValueTask<TResult> ChainInterceptors<TMessage, TResult>(");
-        sb.AppendLine("        System.Collections.Generic.List<IInterceptHandler<TMessage, TResult>> interceptors,");
-        sb.AppendLine("        TMessage message,");
-        sb.AppendLine("        RequestHandlerDelegate<TResult> handler,");
-        sb.AppendLine("        System.Threading.CancellationToken ct)");
-        sb.AppendLine("    {");
-        sb.AppendLine("        RequestHandlerDelegate<TResult> next = handler;");
-        sb.AppendLine("        for (var i = interceptors.Count - 1; i >= 0; i--)");
-        sb.AppendLine("        {");
-        sb.AppendLine("            var interceptor = interceptors[i];");
-        sb.AppendLine("            var current = next;");
-        sb.AppendLine("            next = () => interceptor.HandleAsync(message, current, ct);");
-        sb.AppendLine("        }");
-        sb.AppendLine("        return next();");
-        sb.AppendLine("    }");
+        // Helpers — emitted only when used.
+        if (resultMessages.Any(m => ResultIntercepted(m.Message)))
+        {
+            sb.AppendLine();
+            sb.AppendLine("    private static System.Threading.Tasks.ValueTask<TResult> ChainInterceptors<TMessage, TResult>(");
+            sb.AppendLine("        System.Collections.Generic.List<IInterceptHandler<TMessage, TResult>> interceptors,");
+            sb.AppendLine("        TMessage message,");
+            sb.AppendLine("        RequestHandlerDelegate<TResult> handler,");
+            sb.AppendLine("        System.Threading.CancellationToken ct)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        RequestHandlerDelegate<TResult> next = handler;");
+            sb.AppendLine("        for (var i = interceptors.Count - 1; i >= 0; i--)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            var interceptor = interceptors[i];");
+            sb.AppendLine("            var current = next;");
+            sb.AppendLine("            next = () => interceptor.HandleAsync(message, current, ct);");
+            sb.AppendLine("        }");
+            sb.AppendLine("        return next();");
+            sb.AppendLine("    }");
+        }
 
-        // PublishToHandlers helper
-        sb.AppendLine();
-        sb.AppendLine("    private static async System.Threading.Tasks.ValueTask PublishToHandlers<TEvent>(");
-        sb.AppendLine("        System.Collections.Generic.List<IDomainEventHandler<TEvent>> handlers,");
-        sb.AppendLine("        TEvent domainEvent,");
-        sb.AppendLine("        System.Threading.CancellationToken ct)");
-        sb.AppendLine("    {");
-        sb.AppendLine("        foreach (var handler in handlers)");
-        sb.AppendLine("        {");
-        sb.AppendLine("            await handler.HandleAsync(domainEvent, ct);");
-        sb.AppendLine("        }");
-        sb.AppendLine("    }");
+        if (voidMessages.Any(VoidIntercepted))
+        {
+            sb.AppendLine();
+            sb.AppendLine("    private static System.Threading.Tasks.ValueTask ChainInterceptors<TMessage>(");
+            sb.AppendLine("        System.Collections.Generic.List<IInterceptHandler<TMessage>> interceptors,");
+            sb.AppendLine("        TMessage message,");
+            sb.AppendLine("        RequestHandlerDelegate handler,");
+            sb.AppendLine("        System.Threading.CancellationToken ct)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        RequestHandlerDelegate next = handler;");
+            sb.AppendLine("        for (var i = interceptors.Count - 1; i >= 0; i--)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            var interceptor = interceptors[i];");
+            sb.AppendLine("            var current = next;");
+            sb.AppendLine("            next = () => interceptor.HandleAsync(message, current, ct);");
+            sb.AppendLine("        }");
+            sb.AppendLine("        return next();");
+            sb.AppendLine("    }");
+        }
+
+        if (voidMessages.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("    private static async System.Threading.Tasks.ValueTask InvokeAll<TMessage>(");
+            sb.AppendLine("        System.Collections.Generic.List<IMessageHandler<TMessage>> handlers,");
+            sb.AppendLine("        TMessage message,");
+            sb.AppendLine("        System.Threading.CancellationToken ct)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        foreach (var handler in handlers)");
+            sb.AppendLine("            await handler.HandleAsync(message, ct);");
+            sb.AppendLine("    }");
+        }
 
         sb.AppendLine("}");
-
         return sb.ToString();
     }
 
-    private static string GenerateRegistrationExtension(
-        ImmutableArray<HandlerTypeInfo> handlers,
-        ImmutableArray<SagaInfo> sagas)
+    // ── Registration generation ────────────────────────────────────────
+
+    private static string GenerateRegistration(ImmutableArray<HandlerInfo> all, ImmutableArray<SagaInfo> sagas)
     {
+        var handlers = all.Where(h => !h.IsInterceptor).ToList();
+        var interceptors = all.Where(h => h.IsInterceptor).ToList();
         var hasSagas = !sagas.IsEmpty;
 
         var sb = new StringBuilder();
@@ -531,50 +408,46 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         sb.AppendLine("    public static IServiceCollection AddApplicationHandlers(this IServiceCollection services)");
         sb.AppendLine("    {");
 
-        foreach (var handler in handlers)
+        foreach (var h in handlers)
         {
-            if (handler.IsOpenGeneric)
-            {
-                sb.AppendLine($"        services.AddScoped(typeof(IInterceptHandler<,>), typeof({handler.HandlerType}));");
-                continue;
-            }
+            var iface = h.ResultType is null
+                ? $"IMessageHandler<{h.MessageType}>"
+                : $"IMessageHandler<{h.MessageType}, {h.ResultType}>";
+            sb.AppendLine($"        services.AddScoped<{iface}, {h.HandlerType}>();");
+        }
 
-            var interfaceType = handler.Kind switch
+        foreach (var i in interceptors)
+        {
+            if (i.IsOpenGeneric)
             {
-                HandlerKind.Query => $"IQueryHandler<{handler.MessageType}, {handler.ResultType}>",
-                HandlerKind.Command => $"ICommandHandler<{handler.MessageType}, {handler.ResultType}>",
-                HandlerKind.DomainEvent => $"IDomainEventHandler<{handler.MessageType}>",
-                HandlerKind.Interceptor => $"IInterceptHandler<{handler.MessageType}, {handler.ResultType}>",
-                _ => throw new System.InvalidOperationException($"Unknown handler kind: {handler.Kind}")
-            };
-            sb.AppendLine($"        services.AddScoped<{interfaceType}, {handler.HandlerType}>();");
+                var openIface = i.IsVoidInterceptor ? "typeof(IInterceptHandler<>)" : "typeof(IInterceptHandler<,>)";
+                sb.AppendLine($"        services.AddScoped({openIface}, typeof({i.HandlerType}));");
+            }
+            else
+            {
+                var iface = i.IsVoidInterceptor
+                    ? $"IInterceptHandler<{i.MessageType}>"
+                    : $"IInterceptHandler<{i.MessageType}, {i.ResultType}>";
+                sb.AppendLine($"        services.AddScoped<{iface}, {i.HandlerType}>();");
+            }
         }
 
         if (hasSagas)
         {
             sb.AppendLine();
-            sb.AppendLine("        // Auto-discovered sagas");
-            foreach (var saga in sagas)
-            {
-                sb.AppendLine($"        services.AddSaga<{saga.SagaType}, {saga.StateType}>();");
-            }
+            sb.AppendLine("        // Sagas — coordinators over a grouping of message handlers");
+            foreach (var s in sagas)
+                sb.AppendLine($"        services.AddSaga<{s.SagaType}, {s.StateType}>();");
 
-            // Inline dispatcher registrations (AOT-compatible — no MakeGenericType)
-            var allEventTypes = new HashSet<string>();
-            foreach (var saga in sagas)
-            {
-                foreach (var et in saga.StartedByEventTypes) allEventTypes.Add(et);
-                foreach (var et in saga.HandledByEventTypes) allEventTypes.Add(et);
-            }
-
-            if (allEventTypes.Count > 0)
+            var eventTypes = sagas.SelectMany(s => s.EventTypes).Distinct().ToList();
+            if (eventTypes.Count > 0)
             {
                 sb.AppendLine();
-                sb.AppendLine("        // Auto-discovered saga dispatchers");
-                foreach (var eventType in allEventTypes)
+                sb.AppendLine("        // Saga dispatchers join each event's handler fan-out");
+                foreach (var ev in eventTypes)
                 {
-                    sb.AppendLine($"        services.AddScoped<IDomainEventHandler<{eventType}>>(sp =>");
-                    sb.AppendLine($"            new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<{eventType}>(");
+                    sb.AppendLine($"        services.AddScoped<IMessageHandler<{ev}>>(sp =>");
+                    sb.AppendLine($"            new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<{ev}>(");
                     sb.AppendLine($"                sp.GetRequiredService<System.Collections.Generic.IEnumerable<Andersoft.CQRS.Abstractions.Saga>>()));");
                 }
             }
@@ -598,9 +471,21 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
             sb.AppendLine("        Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddScoped(services, typeof(Andersoft.CQRS.Abstractions.ISagaRepository<>), typeof(Andersoft.CQRS.EntityFrameworkCore.EFCoreSagaRepository<>));");
             sb.AppendLine("        return services;");
             sb.AppendLine("    }");
-        }
-        sb.AppendLine("}");
 
+            sb.AppendLine();
+            sb.AppendLine("    /// <summary>");
+            sb.AppendLine("    /// Maps every saga state type (key on CorrelationId, Version as concurrency token).");
+            sb.AppendLine("    /// Call from <c>OnModelCreating</c>.");
+            sb.AppendLine("    /// </summary>");
+            sb.AppendLine("    public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(this Microsoft.EntityFrameworkCore.ModelBuilder modelBuilder)");
+            sb.AppendLine("    {");
+            foreach (var stateType in sagas.Select(s => s.StateType).Distinct())
+                sb.AppendLine($"        modelBuilder.ConfigureSagaState<{stateType}>();");
+            sb.AppendLine("        return modelBuilder;");
+            sb.AppendLine("    }");
+        }
+
+        sb.AppendLine("}");
         return sb.ToString();
     }
 
@@ -617,62 +502,46 @@ public sealed class DispatcherGenerator : IIncrementalGenerator
         return lastDot >= 0 ? fullTypeName.Substring(lastDot + 1) : fullTypeName;
     }
 
-    private sealed class MessageTypeInfo
+    private sealed class HandlerInfo
     {
-        public string FullTypeName { get; }
-        public string ShortName { get; }
-        public string ResultType { get; }
-        public MessageKind Kind { get; }
+        public bool IsInterceptor { get; private set; }
+        public string HandlerType { get; private set; } = string.Empty;
+        public string MessageType { get; private set; } = string.Empty;
+        public string? ResultType { get; private set; }
+        public bool IsVoidInterceptor { get; private set; }
+        public bool IsOpenGeneric { get; private set; }
 
-        public MessageTypeInfo(string fullTypeName, string shortName, string resultType, MessageKind kind)
+        public static HandlerInfo Handler(string handlerType, string messageType, string? result) => new()
         {
-            FullTypeName = fullTypeName;
-            ShortName = shortName;
-            ResultType = resultType;
-            Kind = kind;
-        }
+            IsInterceptor = false,
+            HandlerType = handlerType,
+            MessageType = messageType,
+            ResultType = result,
+        };
+
+        public static HandlerInfo Interceptor(string handlerType, string messageType, string? result, bool isVoid, bool isOpen) => new()
+        {
+            IsInterceptor = true,
+            HandlerType = handlerType,
+            MessageType = messageType,
+            ResultType = result,
+            IsVoidInterceptor = isVoid,
+            IsOpenGeneric = isOpen,
+        };
     }
 
-    private sealed class HandlerTypeInfo
+    private sealed class ResultMessage
     {
-        public string HandlerType { get; }
-        public string MessageType { get; }
-        public string ResultType { get; }
-        public HandlerKind Kind { get; }
-
-        /// <summary>
-        /// For domain-event handlers, the pipe-delimited list of interfaces implemented by the
-        /// event type. Used to derive the common marker interface for the catch-all dispatch.
-        /// </summary>
-        public string EventInterfaces { get; }
-
-        /// <summary>
-        /// True when the handler is an open generic interceptor (e.g. <c>Logging&lt;TMessage, TResult&gt;</c>)
-        /// that applies to every message. <see cref="HandlerType"/> then holds the unbound generic
-        /// type name (e.g. <c>Foo.Logging&lt;,&gt;</c>) for open generic DI registration.
-        /// </summary>
-        public bool IsOpenGeneric { get; }
-
-        public HandlerTypeInfo(string handlerType, string messageType, string resultType, HandlerKind kind, string eventInterfaces = "", bool isOpenGeneric = false)
-        {
-            HandlerType = handlerType;
-            MessageType = messageType;
-            ResultType = resultType;
-            Kind = kind;
-            EventInterfaces = eventInterfaces;
-            IsOpenGeneric = isOpenGeneric;
-        }
+        public string Message { get; }
+        public string Result { get; }
+        public ResultMessage(string message, string result) { Message = message; Result = result; }
     }
-
-    private enum MessageKind { Query, Command }
-    private enum HandlerKind { Query, Command, DomainEvent, Interceptor }
 
     private sealed class SagaInfo
     {
         public string SagaType { get; }
         public string StateType { get; }
-        public List<string> StartedByEventTypes { get; } = new();
-        public List<string> HandledByEventTypes { get; } = new();
+        public List<string> EventTypes { get; } = new();
         public SagaInfo(string sagaType, string stateType) { SagaType = sagaType; StateType = stateType; }
     }
 }
