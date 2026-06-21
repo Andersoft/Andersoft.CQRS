@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 
 namespace Andersoft.CQRS.Abstractions;
 
-internal interface ISagaStateAccessor
+public interface ISagaStateAccessor
 {
     bool IsNew { get; }
     bool IsStarted { get; }

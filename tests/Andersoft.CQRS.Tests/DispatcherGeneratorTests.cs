@@ -35,16 +35,11 @@ namespace Andersoft.CQRS.Abstractions
     public interface IInterceptHandler<in TMessage> { ValueTask HandleAsync(TMessage message, RequestHandlerDelegate next, CancellationToken ct); }
 
     public abstract class SagaState { public Guid CorrelationId { get; set; } public uint Version { get; set; } }
+
+    // Only the non-generic Saga base is part of the library surface. The generic Saga<TState>
+    // that concrete sagas extend is emitted by the generator (post-initialization), so it is NOT
+    // stubbed here — the generator provides it and the saga tests assert on it.
     public abstract class Saga { }
-    public abstract class Saga<TState> : Saga where TState : SagaState, new()
-    {
-        protected interface ISagaPropertyMapper<out T>
-        {
-            void MapStartedBy<TEvent>(Func<TEvent, Guid> correlation);
-            void MapHandledBy<TEvent>(Func<TEvent, Guid> correlation);
-        }
-        protected abstract void ConfigureHowToFindSaga(ISagaPropertyMapper<TState> mapper);
-    }
 }";
 
     [Fact]
@@ -152,11 +147,15 @@ namespace TestApp
     }
 
     [Fact]
-    public void NoHandlers_GeneratesNoOutput()
+    public void NoHandlers_StillEmitsSagaBaseAndDispatcher()
     {
+        // The Saga<TState> base is always emitted (post-init) so consumers can extend it, and the
+        // dispatcher it references is always emitted alongside — even with no handlers or sagas.
         var source = ContractsSource + @"namespace TestApp { public class PlainClass { } }";
-        var (genResult, _) = Run(source);
-        Assert.Empty(genResult.Results[0].GeneratedSources);
+        var generated = RunAndGet(source);
+
+        Assert.Contains("public abstract class Saga<TSagaState> : Saga", generated.SagaBase);
+        Assert.Contains("public sealed class TypedDispatcher", generated.Dispatcher);
     }
 
     [Fact]
@@ -258,6 +257,7 @@ namespace TestApp
 
     public sealed class WorkflowState : SagaState { }
 
+    // No `partial` — the generated Saga<TState> base carries the dispatcher.
     public sealed class WorkflowSaga
         : Saga<WorkflowState>, IMessageHandler<NodeStarted>, IMessageHandler<NodeCompleted>
     {
@@ -276,8 +276,10 @@ namespace TestApp
         Assert.DoesNotContain("TestApp.WorkflowSaga>();", generated.Registration);
         Assert.DoesNotContain("IMessageHandler<TestApp.NodeStarted>, TestApp.WorkflowSaga>", generated.Registration);
 
-        // ...it's an AddSaga coordinator, and its events flow through SagaDispatcher fan-out.
-        Assert.Contains("services.AddSaga<TestApp.WorkflowSaga, TestApp.WorkflowState>();", generated.Registration);
+        // ...it's an AddSaga coordinator with the scoped TypedDispatcher injected, and its
+        // events flow through SagaDispatcher fan-out.
+        Assert.Contains("services.AddSaga<TestApp.WorkflowSaga, TestApp.WorkflowState>(", generated.Registration);
+        Assert.Contains("static (saga, sp) => saga.Dispatcher = sp.GetRequiredService<TypedDispatcher>());", generated.Registration);
         Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeStarted>(", generated.Registration);
         Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeCompleted>(", generated.Registration);
 
@@ -287,6 +289,11 @@ namespace TestApp
         // EF model config for the state type is generated for OnModelCreating.
         Assert.Contains("public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(", generated.Registration);
         Assert.Contains("modelBuilder.ConfigureSagaState<TestApp.WorkflowState>();", generated.Registration);
+
+        // The generated Saga<TState> base (always emitted) carries the strongly-typed dispatcher
+        // that the configure callback injects — no `partial` required on the consumer's saga.
+        Assert.Contains("public abstract class Saga<TSagaState> : Saga", generated.SagaBase);
+        Assert.Contains("global::Andersoft.CQRS.TypedDispatcher Dispatcher { get; internal set; }", generated.SagaBase);
     }
 
     // ── harness ────────────────────────────────────────────────────────
@@ -295,6 +302,7 @@ namespace TestApp
     {
         public string Dispatcher { get; init; } = string.Empty;
         public string Registration { get; init; } = string.Empty;
+        public string SagaBase { get; init; } = string.Empty;
     }
 
     private static Generated RunAndGet(string source)
@@ -305,6 +313,7 @@ namespace TestApp
         {
             Dispatcher = generated.Single(s => s.HintName == "TypedDispatcher.g.cs").SourceText.ToString(),
             Registration = generated.Single(s => s.HintName == "HandlerRegistration.g.cs").SourceText.ToString(),
+            SagaBase = generated.Single(s => s.HintName == "SagaBase.g.cs").SourceText.ToString(),
         };
     }
 
@@ -321,15 +330,16 @@ namespace TestApp
             references,
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        var diags = compilation.GetDiagnostics();
-        if (diags.Any(d => d.Severity == DiagnosticSeverity.Error))
-        {
-            var err = string.Join("\n", diags.Where(d => d.Severity == DiagnosticSeverity.Error));
-            throw new Exception($"Compilation errors: {err}");
-        }
-
+        // The input is intentionally NOT required to compile standalone: a saga extends the
+        // generator-provided Saga<TState> base, which is absent until the generator runs (and
+        // generators run fine against compilations with errors). Generation correctness is asserted
+        // on the emitted text instead.
         var generator = new DispatcherGenerator();
-        GeneratorDriver driver = CSharpGeneratorDriver.Create(generator);
+        // Match the input's parse options so post-initialization sources don't trip the
+        // "inconsistent language versions" guard when added to the compilation.
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { generator.AsSourceGenerator() },
+            parseOptions: ParseOptions);
         driver = driver.RunGenerators(compilation);
         return (driver.GetRunResult(), compilation);
     }
