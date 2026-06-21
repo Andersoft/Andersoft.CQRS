@@ -99,8 +99,21 @@ namespace Andersoft.CQRS.Abstractions
         /// <summary>Pre-loaded saga data. Null only before any event is handled.</summary>
         protected TSagaState? Data => Accessor is SagaStateAccessor<TSagaState> a ? a.Data : null;
 
-        /// <summary>Scoped, strongly-typed dispatcher. Injected during saga registration.</summary>
-        protected internal global::Andersoft.CQRS.TypedDispatcher Dispatcher { get; internal set; } = null!;
+        /// <summary>
+        /// Factory for the scoped <c>TypedDispatcher</c>, assigned during saga registration. Stored as
+        /// a deferred factory rather than the resolved instance because the dispatcher's handler
+        /// fan-out includes this saga: resolving it eagerly while the saga is being constructed would
+        /// close a DI dependency cycle (TypedDispatcher -> SagaDispatcher -> IEnumerable&lt;Saga&gt; ->
+        /// this saga -> TypedDispatcher). See <see cref=""Dispatcher"" />.
+        /// </summary>
+        protected internal global::System.Func<global::Andersoft.CQRS.TypedDispatcher> DispatcherFactory { get; internal set; } = null!;
+
+        /// <summary>
+        /// Scoped, strongly-typed dispatcher, resolved lazily on first access. Safe to use from saga
+        /// handlers: by the time a handler runs the dispatcher is already fully constructed, so the
+        /// deferred lookup returns that same scoped instance without re-entering construction.
+        /// </summary>
+        protected internal global::Andersoft.CQRS.TypedDispatcher Dispatcher => DispatcherFactory();
 
         /// <summary>Maps an event to a saga via its correlation id.</summary>
         protected interface ISagaPropertyMapper<out TState>
@@ -512,12 +525,14 @@ namespace Andersoft.CQRS.Abstractions
         {
             sb.AppendLine();
             sb.AppendLine("        // Sagas — coordinators over a grouping of message handlers.");
-            sb.AppendLine("        // The configure callback injects the scoped TypedDispatcher into the");
-            sb.AppendLine("        // saga's generated Saga<TState> base (see SagaBase.g.cs).");
+            sb.AppendLine("        // The configure callback wires a DEFERRED TypedDispatcher factory into the");
+            sb.AppendLine("        // saga's generated Saga<TState> base (see SagaBase.g.cs). It must stay deferred:");
+            sb.AppendLine("        // the dispatcher's fan-out includes this saga, so resolving it eagerly here would");
+            sb.AppendLine("        // form a DI construction cycle.");
             foreach (var s in sagas)
             {
                 sb.AppendLine($"        services.AddSaga<{s.SagaType}, {s.StateType}>(");
-                sb.AppendLine("            static (saga, sp) => saga.Dispatcher = sp.GetRequiredService<TypedDispatcher>());");
+                sb.AppendLine("            static (saga, sp) => saga.DispatcherFactory = () => sp.GetRequiredService<TypedDispatcher>());");
             }
 
             var eventTypes = sagas.SelectMany(s => s.EventTypes).Distinct().ToList();

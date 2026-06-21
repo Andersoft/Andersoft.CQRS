@@ -276,10 +276,10 @@ namespace TestApp
         Assert.DoesNotContain("TestApp.WorkflowSaga>();", generated.Registration);
         Assert.DoesNotContain("IMessageHandler<TestApp.NodeStarted>, TestApp.WorkflowSaga>", generated.Registration);
 
-        // ...it's an AddSaga coordinator with the scoped TypedDispatcher injected, and its
-        // events flow through SagaDispatcher fan-out.
+        // ...it's an AddSaga coordinator with a DEFERRED TypedDispatcher factory wired in (resolving
+        // it eagerly would form a DI cycle), and its events flow through SagaDispatcher fan-out.
         Assert.Contains("services.AddSaga<TestApp.WorkflowSaga, TestApp.WorkflowState>(", generated.Registration);
-        Assert.Contains("static (saga, sp) => saga.Dispatcher = sp.GetRequiredService<TypedDispatcher>());", generated.Registration);
+        Assert.Contains("static (saga, sp) => saga.DispatcherFactory = () => sp.GetRequiredService<TypedDispatcher>());", generated.Registration);
         Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeStarted>(", generated.Registration);
         Assert.Contains("new Andersoft.CQRS.EntityFrameworkCore.SagaDispatcher<TestApp.NodeCompleted>(", generated.Registration);
 
@@ -290,10 +290,12 @@ namespace TestApp
         Assert.Contains("public static Microsoft.EntityFrameworkCore.ModelBuilder ApplySagaConfigurations(", generated.Registration);
         Assert.Contains("modelBuilder.ConfigureSagaState<TestApp.WorkflowState>();", generated.Registration);
 
-        // The generated Saga<TState> base (always emitted) carries the strongly-typed dispatcher
-        // that the configure callback injects — no `partial` required on the consumer's saga.
+        // The generated Saga<TState> base (always emitted) carries a deferred dispatcher factory that
+        // the configure callback wires up, plus a lazy Dispatcher getter — no `partial` required on
+        // the consumer's saga.
         Assert.Contains("public abstract class Saga<TSagaState> : Saga", generated.SagaBase);
-        Assert.Contains("global::Andersoft.CQRS.TypedDispatcher Dispatcher { get; internal set; }", generated.SagaBase);
+        Assert.Contains("global::System.Func<global::Andersoft.CQRS.TypedDispatcher> DispatcherFactory { get; internal set; }", generated.SagaBase);
+        Assert.Contains("global::Andersoft.CQRS.TypedDispatcher Dispatcher => DispatcherFactory();", generated.SagaBase);
     }
 
     // ── harness ────────────────────────────────────────────────────────
